@@ -1,0 +1,21 @@
+fastapi==0.129.0
+uvicorn==0.40.0
+pydantic==2.12.5
+sentence-transformers==3.0.1
+pinecone
+openai
+python-dotenv
+httpx
+redis
+tenacity
+numpy
+asyncpg
+yahooquery
+lxml
+pandas
+openpyxl
+chardet
+python-dateutil
+aiofiles           # async file I/O — used in documents/routes.py for non-blocking disk writes
+python-multipart   # required by FastAPI to parse multipart/form-data (UploadFile)
+pypdf              # PDF text extraction — used in documents/worker.py (Stage 3)

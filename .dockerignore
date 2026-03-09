@@ -1,0 +1,47 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+dist
+build
+
+# Virtual environments
+venv
+.venv
+env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Environment & secrets
+# .env
+# .env.*
+
+# Tests & docs
+test_*.py
+tests/
+*.md
+LICENSE
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Models cache (downloaded at runtime)
+*.bin
+*.pt
+*.onnx
