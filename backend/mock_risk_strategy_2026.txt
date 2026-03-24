@@ -1,0 +1,17 @@
+ASSET ALLOCATION STRATEGY & RISK ASSESSMENT 2026
+
+Strategic Objective:
+Long-term capital appreciation with moderate risk tolerance. Focus on diversified equity exposure and inflation-protected fixed income.
+
+Risk Factors:
+1. Interest Rate Risk: High sensitivity to central bank decisions. A 1% rise in rates could impact bond portfolio value by 5.5%.
+2. Currency Risk: Portfolio has 40% exposure to USD. Volatility in USD/ILS rate directly impacts net asset value.
+3. Concentration Risk: Top 5 holdings represent 22% of total assets.
+
+Risk Mitigation Steps:
+- Use currency hedging for 50% of USD exposure.
+- Diversify across non-correlated sectors (e.g., Healthcare, Utilities).
+- Maintain a 12-month trailing cash buffer for liquidity.
+
+Policy Compliance:
+Current portfolio is 98% compliant with internal risk guidelines. Minor breach in sector concentration (Technology) is being addressed via staged sell-offs.
