@@ -1,8 +1,8 @@
 import { useCallback, useRef, useState } from "react";
-import { FileText, Upload, CheckCircle2, Loader2, AlertCircle, Trash2, Layers, ChevronLeft, ChevronRight, Cpu, Sparkles } from "lucide-react";
+import { FileText, Upload, CheckCircle2, Loader2, AlertCircle, Trash2, Layers, ChevronLeft, ChevronRight, Cpu, Sparkles, FolderOpen, Folder as FolderIcon, FolderPlus, X } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import type { UploadedDocument } from "@/lib/api";
-import { uploadDocument } from "@/lib/api";
+import type { UploadedDocument, Folder } from "@/lib/api";
+import { uploadDocument, fetchDocumentStatus } from "@/lib/api";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -19,6 +19,12 @@ interface Props {
   isInsideSidebar?: boolean;
   selectedIds?: string[];
   onToggleSelection?: (id: string) => void;
+  folders?: Folder[];
+  activeFolderId?: number | null;
+  onFolderSelect?: (id: number | null) => void;
+  onFolderCreate?: (name: string) => void;
+  onFolderDelete?: (id: number) => void;
+  onAssignFolder?: (docId: string, folderId: number | null) => void;
 }
 
 const statusConfig: Record<UploadedDocument["status"], { icon: typeof Loader2; label: string; colorClass: string }> = {
@@ -40,33 +46,79 @@ export function DocumentSidebar({
   isInsideSidebar,
   selectedIds = [],
   onToggleSelection,
+  folders = [],
+  activeFolderId = null,
+  onFolderSelect,
+  onFolderCreate,
+  onFolderDelete,
+  onAssignFolder,
 }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const activePollsRef = useRef<Map<string, { cancelled: boolean }>>(new Map());
+  const [newFolderName, setNewFolderName] = useState("");
+  const [showFolderInput, setShowFolderInput] = useState(false);
 
-  const simulateIndexing = useCallback(async (id: string) => {
-    const stages: UploadedDocument["status"][] = ["extracting", "embedding", "indexed"];
-    for (const stage of stages) {
-      await new Promise((r) => setTimeout(r, 800 + Math.random() * 600));
-      onDocumentStatusChange(id, stage);
+  const handleFolderCreate = () => {
+    const name = newFolderName.trim();
+    if (name && onFolderCreate) {
+      onFolderCreate(name);
+      setNewFolderName("");
+      setShowFolderInput(false);
     }
+  };
+
+  const visibleDocuments = activeFolderId != null
+    ? documents.filter(d => d.folder_id === activeFolderId)
+    : documents;
+
+  const pollDocumentStatus = useCallback(async (id: string) => {
+    const handle = { cancelled: false };
+    activePollsRef.current.set(id, handle);
+    const POLL_INTERVAL = 2500;
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    const deadline = Date.now() + TIMEOUT_MS;
+    while (Date.now() < deadline && !handle.cancelled) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+      if (handle.cancelled) break;
+      try {
+        const doc = await fetchDocumentStatus(id);
+        if (handle.cancelled) break;
+        if (!doc) { onDocumentStatusChange(id, "error"); break; }
+        onDocumentStatusChange(id, doc.status);
+        if (doc.status === "indexed" || doc.status === "error") break;
+      } catch {
+        // transient fetch error — keep polling
+      }
+    }
+    if (!handle.cancelled && Date.now() >= deadline) {
+      onDocumentStatusChange(id, "error");
+    }
+    activePollsRef.current.delete(id);
   }, [onDocumentStatusChange]);
 
   const handleFiles = useCallback(async (files: FileList) => {
     for (const file of Array.from(files)) {
       const isAllowed = file.name.endsWith(".pdf") || file.name.endsWith(".txt");
       if (!isAllowed) continue;
-      const id = crypto.randomUUID();
-      const doc: UploadedDocument = { id, name: file.name, uploadedAt: new Date(), status: "uploading" };
+      const tempId = crypto.randomUUID();
+      const doc: UploadedDocument = { id: tempId, name: file.name, uploadedAt: new Date(), status: "uploading", folder_id: activeFolderId };
       onDocumentUploaded(doc);
       try {
-        await uploadDocument(file);
-        simulateIndexing(id);
+        const { document_id } = await uploadDocument(file, activeFolderId ?? undefined, tempId);
+        // If server used a different ID (shouldn't happen since we send tempId, but be safe)
+        if (document_id !== tempId) {
+          onDocumentDelete(tempId);
+          onDocumentUploaded({ id: document_id, name: file.name, uploadedAt: new Date(), status: "extracting", folder_id: activeFolderId });
+        } else {
+          onDocumentStatusChange(tempId, "extracting");
+        }
+        pollDocumentStatus(document_id);
       } catch {
-        onDocumentStatusChange(id, "error");
+        onDocumentStatusChange(tempId, "error");
       }
     }
-  }, [onDocumentUploaded, onDocumentStatusChange, simulateIndexing]);
+  }, [onDocumentUploaded, onDocumentStatusChange, onDocumentDelete, pollDocumentStatus, activeFolderId]);
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -76,6 +128,62 @@ export function DocumentSidebar({
 
   const content = (
     <div className="flex-1 scroll-stable p-3 space-y-2">
+
+      {/* Folder filter strip */}
+      {onFolderSelect && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground/60">Folders</span>
+            <button
+              onClick={() => setShowFolderInput(v => !v)}
+              className="p-1 rounded hover:bg-muted transition-colors text-muted-foreground"
+              title="New folder"
+            >
+              <FolderPlus className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          {showFolderInput && (
+            <div className="flex gap-1">
+              <input
+                autoFocus
+                value={newFolderName}
+                onChange={e => setNewFolderName(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter") handleFolderCreate(); if (e.key === "Escape") setShowFolderInput(false); }}
+                placeholder="Folder name…"
+                className="flex-1 text-xs px-2 py-1 rounded border border-border bg-background outline-none focus:border-primary"
+              />
+              <button onClick={handleFolderCreate} className="px-2 py-1 text-xs rounded bg-primary text-primary-foreground hover:opacity-90">Add</button>
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-1">
+            <button
+              onClick={() => onFolderSelect(null)}
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] border transition-colors ${activeFolderId === null ? "bg-primary/10 text-primary border-primary/20" : "text-muted-foreground border-border hover:border-muted-foreground"}`}
+            >
+              <FolderOpen className="h-3 w-3" />
+              All
+            </button>
+            {folders.map(f => (
+              <span key={f.id} className={`group inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded-full text-[11px] border transition-colors cursor-pointer ${activeFolderId === f.id ? "bg-primary/10 text-primary border-primary/20" : "text-muted-foreground border-border hover:border-muted-foreground"}`}>
+                <FolderIcon className="h-3 w-3 flex-shrink-0" />
+                <span onClick={() => onFolderSelect(f.id)}>{f.name}</span>
+                {onFolderDelete && (
+                  <button
+                    onClick={e => { e.stopPropagation(); onFolderDelete(f.id); }}
+                    className="ml-0.5 opacity-0 group-hover:opacity-100 hover:text-destructive transition-all"
+                    title="Delete folder"
+                  >
+                    <X className="h-2.5 w-2.5" />
+                  </button>
+                )}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div
         onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
         onDragLeave={() => setIsDragging(false)}
@@ -97,7 +205,7 @@ export function DocumentSidebar({
       </div>
 
       <AnimatePresence>
-        {documents.map((doc) => {
+        {visibleDocuments.map((doc) => {
           const cfg = statusConfig[doc.status] || statusConfig.error;
           const StatusIcon = cfg.icon;
           const isAnimating = ["uploading", "extracting", "embedding"].includes(doc.status);
@@ -194,10 +302,33 @@ export function DocumentSidebar({
                     <TooltipContent>View chunks</TooltipContent>
                   </Tooltip>
                 )}
+                {onAssignFolder && folders.length > 0 && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <select
+                        value={doc.folder_id ?? ""}
+                        onChange={e => onAssignFolder(doc.id, e.target.value === "" ? null : Number(e.target.value))}
+                        onClick={e => e.stopPropagation()}
+                        className="text-[10px] font-mono bg-transparent text-muted-foreground border border-border rounded px-1 py-0.5 cursor-pointer hover:border-muted-foreground focus:outline-none max-w-[90px] truncate"
+                        title="Assign to folder"
+                      >
+                        <option value="">No folder</option>
+                        {folders.map(f => (
+                          <option key={f.id} value={f.id}>{f.name}</option>
+                        ))}
+                      </select>
+                    </TooltipTrigger>
+                    <TooltipContent>Assign to folder</TooltipContent>
+                  </Tooltip>
+                )}
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <button
-                      onClick={() => onDocumentDelete(doc.id)}
+                      onClick={() => {
+                        const poll = activePollsRef.current.get(doc.id);
+                        if (poll) poll.cancelled = true;
+                        onDocumentDelete(doc.id);
+                      }}
                       className="p-1 rounded hover:bg-destructive/10 transition-colors ml-auto"
                     >
                       <Trash2 className="h-3.5 w-3.5 text-destructive/70" />

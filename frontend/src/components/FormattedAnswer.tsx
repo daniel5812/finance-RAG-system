@@ -1,5 +1,7 @@
 import ReactMarkdown from "react-markdown";
 import type { Citation } from "@/lib/api";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { FileText, Table2 } from "lucide-react";
 
 interface Props {
   text: string;
@@ -8,21 +10,54 @@ interface Props {
 }
 
 export function FormattedAnswer({ text, citations, onCitationClick }: Props) {
+  // 🛡️ Strip internal metadata blocks that might have leaked into the stream
+  const cleanText = text.replace(/\[\[Explainability:.*?\]\]/g, "").replace(/\[\[SuggestedQuestions:.*?\]\]/g, "").trim();
+
   // Split text into parts: regular text and citation tags
-  const parts = text.split(/(\[[SD]\d+\])/g);
+  const parts = cleanText.split(/(\[[SD]\d+\])/g);
 
   // Reassemble: render markdown for text parts, interactive badges for citations
   const elements = parts.map((part, i) => {
     const match = part.match(/^\[([SD]\d+)\]$/);
-    if (match && citations[part]) {
+    const citation = match ? citations[part] : null;
+
+    if (citation) {
       return (
-        <button
-          key={i}
-          onClick={() => onCitationClick(part, citations[part])}
-          className="citation-badge"
-        >
-          {part}
-        </button>
+        <HoverCard key={i} openDelay={200} closeDelay={100}>
+          <HoverCardTrigger asChild>
+            <button
+              onClick={() => onCitationClick(part, citation)}
+              className="citation-badge"
+            >
+              {part.replace(/[\[\]]/g, '')}
+            </button>
+          </HoverCardTrigger>
+          <HoverCardContent className="w-80 p-3 bg-card border-border shadow-xl z-[100]">
+            <div className="flex gap-3">
+              <div className="mt-1">
+                {citation.source_type === "sql" ? (
+                  <Table2 className="h-4 w-4 text-primary" />
+                ) : (
+                  <FileText className="h-4 w-4 text-primary" />
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="label-mono text-[8px]">{part}</span>
+                  <span className="text-[10px] font-semibold truncate text-foreground">
+                    {citation.display_name}
+                  </span>
+                </div>
+                <p className="text-[11px] text-muted-foreground line-clamp-3 leading-relaxed">
+                  {citation.context}
+                </p>
+                <div className="mt-2 text-[9px] font-mono text-primary/70">
+                  Click to see full source →
+                </div>
+              </div>
+            </div>
+          </HoverCardContent>
+        </HoverCard>
       );
     }
     // Render markdown for text segments

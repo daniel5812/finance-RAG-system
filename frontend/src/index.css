@@ -121,25 +121,29 @@
   }
 
   .citation-badge {
-    @apply inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded border border-primary/30 bg-primary/10 text-primary text-[11px] font-mono cursor-pointer transition-colors duration-100;
+    @apply inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 mx-0.5 rounded-full border border-primary/30 bg-primary/5 text-primary text-[10px] font-bold cursor-pointer transition-all duration-200 align-top mt-[-2px] hover:bg-primary/20 hover:scale-110 active:scale-95;
   }
 
-  .citation-badge:hover {
-    @apply bg-primary/20 border-primary/50;
+  .suggested-question-chip {
+    @apply inline-flex items-center px-4 py-2 rounded-xl border border-border bg-card/50 text-xs text-foreground hover:bg-primary/5 hover:border-primary/30 hover:text-primary transition-all duration-200 cursor-pointer animate-in fade-in slide-in-from-bottom-2;
   }
 
   .latency-segment {
-    @apply h-1 transition-all duration-300;
+    @apply h-1 transition-all duration-500 ease-out;
+  }
+
+  .latency-loading {
+    @apply animate-pulse h-1 bg-muted-foreground/20 rounded-full w-24;
   }
 
   .label-mono {
-    @apply font-mono text-[10px] uppercase tracking-[0.15em] text-muted-foreground;
+    @apply font-mono text-[9px] uppercase tracking-[0.2em] text-muted-foreground font-medium;
   }
 
   .scroll-stable {
     overflow-y: auto;
     overflow-anchor: auto;
-    scroll-behavior: auto;
+    scroll-behavior: smooth;
   }
 
   .input-glow-pulse {
@@ -156,5 +160,22 @@
     50% {
       box-shadow: 0 0 0 2px hsl(var(--primary) / 0.4), 0 0 12px hsl(var(--primary) / 0.1);
     }
+  }
+
+  /* RTL support — applied automatically when dir="auto" detects Hebrew */
+  [dir="rtl"] {
+    text-align: right;
+  }
+
+  /* Elements that should auto-detect direction (Hebrew vs LTR) */
+  .text-auto-dir {
+    direction: auto;
+    unicode-bidi: plaintext;
+    text-align: start;
+  }
+
+  /* Flex rows that need to reverse on RTL */
+  [dir="rtl"] .rtl-row-reverse {
+    flex-direction: row-reverse;
   }
 }

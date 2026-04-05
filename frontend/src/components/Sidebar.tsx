@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ChatSession, UploadedDocument } from "@/lib/api";
+import { useNavigate } from "react-router-dom";
 import {
     MessageSquare,
     Files,
@@ -8,10 +9,21 @@ import {
     ChevronLeft,
     ChevronRight,
     Clock,
-    FileText
+    Activity,
+    ShieldAlert,
+    TrendingUp,
+    Lightbulb
 } from "lucide-react";
+
+
 import { DocumentSidebar } from "./DocumentSidebar";
+import { MetricsModal } from "./MetricsModal";
+import { getUser } from "@/lib/auth";
 import { cn } from "@/lib/utils";
+import { useInsights } from "@/lib/insights";
+import type { Folder } from "@/lib/api";
+
+
 
 interface SidebarProps {
     sessions: ChatSession[];
@@ -27,6 +39,12 @@ interface SidebarProps {
     onToggleCollapse: () => void;
     selectedDocumentIds: string[];
     onToggleDocumentSelection: (id: string) => void;
+    folders: Folder[];
+    activeFolderId: number | null;
+    onFolderSelect: (id: number | null) => void;
+    onFolderCreate: (name: string) => void;
+    onFolderDelete: (id: number) => void;
+    onAssignFolder: (docId: string, folderId: number | null) => void;
 }
 
 export function Sidebar({
@@ -42,9 +60,22 @@ export function Sidebar({
     collapsed,
     onToggleCollapse,
     selectedDocumentIds,
-    onToggleDocumentSelection
+    onToggleDocumentSelection,
+    folders,
+    activeFolderId,
+    onFolderSelect,
+    onFolderCreate,
+    onFolderDelete,
+    onAssignFolder,
 }: SidebarProps) {
     const [activeTab, setActiveTab] = useState<"chats" | "docs">("chats");
+    const [showMetrics, setShowMetrics] = useState(false);
+    const navigate = useNavigate();
+    const user = getUser();
+    const hasAdminScope = user?.scopes?.includes("admin:read") || user?.role === "admin";
+    const { hasNewInsights } = useInsights();
+
+
 
     return (
         <div
@@ -114,6 +145,12 @@ export function Sidebar({
                         <button onClick={() => setActiveTab("docs")} className={cn("p-2 rounded-lg transition-all", activeTab === "docs" ? "bg-muted text-primary" : "text-muted-foreground")} title="Document Sources">
                             <Files className="h-5 w-5" />
                         </button>
+                        <button onClick={() => navigate('/insights')} className="relative p-2 rounded-lg text-muted-foreground hover:bg-muted transition-all" title="Insights">
+                            <Lightbulb className="h-5 w-5" />
+                            {hasNewInsights && (
+                                <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-primary" />
+                            )}
+                        </button>
                     </div>
                 ) : (
                     activeTab === "chats" ? (
@@ -163,11 +200,17 @@ export function Sidebar({
                                 onDocumentUploaded={onDocumentUploaded}
                                 onDocumentStatusChange={onDocumentStatusChange}
                                 onDocumentDelete={onDocumentDelete}
-                                collapsed={false} // Always expanded inside the tab
-                                onToggleCollapse={() => { }} // No-op inside tab
-                                isInsideSidebar // New prop to adjust styling
+                                collapsed={false}
+                                onToggleCollapse={() => { }}
+                                isInsideSidebar
                                 selectedIds={selectedDocumentIds}
                                 onToggleSelection={onToggleDocumentSelection}
+                                folders={folders}
+                                activeFolderId={activeFolderId}
+                                onFolderSelect={onFolderSelect}
+                                onFolderCreate={onFolderCreate}
+                                onFolderDelete={onFolderDelete}
+                                onAssignFolder={onAssignFolder}
                             />
                         </div>
                     )
@@ -176,7 +219,47 @@ export function Sidebar({
 
             {/* Sidebar Footer */}
             {!collapsed && (
-                <div className="p-4 border-t border-border/50">
+                <div className="p-4 border-t border-border/50 space-y-2">
+                    {hasAdminScope && (
+                        <button
+                            onClick={() => navigate('/admin')}
+                            className="w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground transition-all group"
+                        >
+                            <ShieldAlert className="h-4 w-4 text-amber-500 group-hover:animate-pulse" />
+                            <span className="text-xs font-medium">Admin Console</span>
+                        </button>
+                    )}
+
+                    <button
+                        onClick={() => navigate('/insights')}
+                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground transition-all group"
+                    >
+                        <div className="relative">
+                            <Lightbulb className="h-4 w-4 text-primary group-hover:animate-pulse" />
+                            {hasNewInsights && (
+                                <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-primary" />
+                            )}
+                        </div>
+                        <span className="text-xs font-medium">Insights</span>
+                    </button>
+
+                    <button
+                        onClick={() => navigate('/portfolio')}
+                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground transition-all group"
+                    >
+                        <TrendingUp className="h-4 w-4 text-primary group-hover:animate-pulse" />
+                        <span className="text-xs font-medium">Portfolio</span>
+                    </button>
+
+                    <button
+                        onClick={() => setShowMetrics(true)}
+                        className="w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground transition-all group"
+                    >
+                        <Activity className="h-4 w-4 text-primary group-hover:animate-pulse" />
+                        <span className="text-xs font-medium">System Status</span>
+                    </button>
+
+
                     <div className="flex items-center gap-3 px-3 py-2 rounded-lg bg-muted/30">
                         <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center text-primary font-bold text-xs">
                             AD
@@ -188,6 +271,12 @@ export function Sidebar({
                     </div>
                 </div>
             )}
+
+            <MetricsModal
+                isOpen={showMetrics}
+                onClose={() => setShowMetrics(false)}
+            />
         </div>
+
     );
 }

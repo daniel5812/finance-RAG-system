@@ -11,9 +11,13 @@ import { SuggestedQueries } from "@/components/SuggestedQueries";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { Sidebar } from "@/components/Sidebar";
 import { SettingsModal } from "@/components/SettingsModal";
-import { sendChat, fetchDocuments, fetchUserSettings, updateUserSettings, listSessions, getSessionMessages, deleteSession, createSession } from "@/lib/api";
-import type { Citation, LatencyBreakdown, UploadedDocument, QueryExecution, EngineMode, UserSettings, ChatSession } from "@/lib/api";
+import { UserProfile } from "@/components/UserProfile";
+
+import { sendChat, sendChatStream, fetchDocuments, fetchUserProfile, updateUserProfile, listSessions, getSessionMessages, deleteSession, createSession, deleteDocument, fetchFolders, createFolder, deleteFolder, setDocumentFolder } from "@/lib/api";
+import type { Citation, LatencyBreakdown, UploadedDocument, QueryExecution, EngineMode, UserProfile as UserProfileType, ChatSession, UserProfileUpdatePayload, Folder } from "@/lib/api";
+import { getUser } from "@/lib/auth";
 import { Settings as SettingsIcon, MessageSquare } from "lucide-react";
+
 
 interface ChatEntry {
   role: "user" | "assistant";
@@ -34,10 +38,13 @@ export default function Index() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [engineMode, setEngineMode] = useState<EngineMode | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [userSettings, setUserSettings] = useState<UserSettings>({ user_id: "test_advisor_user", custom_persona: null });
+  const [userSettings, setUserSettings] = useState<UserProfileType>({ user_id: getUser()?.id || "unknown", custom_persona: null, risk_tolerance: "medium", preferred_style: "deep", interests: [] });
+
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [selectedDocumentIds, setSelectedDocumentIds] = useState<string[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
   const [viewingSource, setViewingSource] = useState<{ id: string, name: string, citation: Citation | null } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const userScrolled = useRef(false);
@@ -65,6 +72,11 @@ export default function Index() {
       try {
         const docs = await fetchDocuments();
         setDocuments(docs);
+        // Auto-select all already-indexed documents on load
+        const indexedIds = docs.filter((d) => d.status === "indexed").map((d) => d.id);
+        if (indexedIds.length > 0) {
+          setSelectedDocumentIds(indexedIds);
+        }
       } catch (err) {
         console.error("Failed to load documents:", err);
       }
@@ -72,9 +84,43 @@ export default function Index() {
     loadDocs();
   }, []);
 
+  useEffect(() => {
+    fetchFolders().then(setFolders).catch(err => console.error("Failed to load folders:", err));
+  }, []);
+
+  const handleFolderCreate = useCallback(async (name: string) => {
+    try {
+      const folder = await createFolder(name);
+      setFolders(prev => [...prev, folder]);
+    } catch (err) {
+      console.error("Failed to create folder:", err);
+    }
+  }, []);
+
+  const handleFolderDelete = useCallback(async (id: number) => {
+    try {
+      await deleteFolder(id);
+      setFolders(prev => prev.filter(f => f.id !== id));
+      if (activeFolderId === id) setActiveFolderId(null);
+      // Clear folder_id on docs that were in the deleted folder
+      setDocuments(prev => prev.map(d => d.folder_id === id ? { ...d, folder_id: null } : d));
+    } catch (err) {
+      console.error("Failed to delete folder:", err);
+    }
+  }, [activeFolderId]);
+
+  const handleAssignFolder = useCallback(async (docId: string, folderId: number | null) => {
+    try {
+      await setDocumentFolder(docId, folderId);
+      setDocuments(prev => prev.map(d => d.id === docId ? { ...d, folder_id: folderId } : d));
+    } catch (err) {
+      console.error("Failed to assign folder:", err);
+    }
+  }, []);
+
   const loadSessions = async () => {
     try {
-      const data = await listSessions("test_advisor_user");
+      const data = await listSessions();
       if (Array.isArray(data)) {
         setSessions(data);
       } else {
@@ -93,7 +139,7 @@ export default function Index() {
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const settings = await fetchUserSettings("test_advisor_user");
+        const settings = await fetchUserProfile();
         setUserSettings(settings);
       } catch (err) {
         console.error("Failed to load user settings:", err);
@@ -102,9 +148,9 @@ export default function Index() {
     loadSettings();
   }, []);
 
-  const handleSaveSettings = async (persona: string) => {
+  const handleSaveSettings = async (updates: UserProfileUpdatePayload) => {
     try {
-      const updated = await updateUserSettings({ user_id: "test_advisor_user", custom_persona: persona });
+      const updated = await updateUserProfile(updates);
       setUserSettings(updated);
     } catch (err) {
       console.error("Failed to update settings:", err);
@@ -125,12 +171,17 @@ export default function Index() {
         if (typeof parsedLatency === "string") {
           try { parsedLatency = JSON.parse(parsedLatency); } catch { parsedLatency = {}; }
         }
+        let parsedSuggestedQuestions = m.suggested_questions;
+        if (typeof parsedSuggestedQuestions === "string") {
+          try { parsedSuggestedQuestions = JSON.parse(parsedSuggestedQuestions); } catch { parsedSuggestedQuestions = []; }
+        }
 
         return {
           role: m.role,
           content: m.content,
           citations: parsedCitations,
-          latency: parsedLatency
+          latency: parsedLatency,
+          suggestedQuestions: Array.isArray(parsedSuggestedQuestions) && parsedSuggestedQuestions.length > 0 ? parsedSuggestedQuestions : undefined,
         };
       });
       setMessages(mappedMessages);
@@ -171,42 +222,66 @@ export default function Index() {
       // 🔹 0. Create session if it doesn't exist
       let sessionId = activeSessionId;
       if (!sessionId) {
-        const newSession = await createSession("test_advisor_user");
+        const newSession = await createSession();
         sessionId = newSession.id;
         setActiveSessionId(sessionId);
         setSessions(prev => [newSession, ...prev]);
       }
 
-      const history = messages.map(m => ({ role: m.role, content: m.content }));
-      const res = await sendChat(
+      // Backend uses at most 6 messages (3 with summary, 6 without) — no need to send more
+      const history = messages.slice(-6).map(m => ({ role: m.role, content: m.content }));
+
+      // Initialize assistant entry for streaming
+      let currentAssistantMessage = "";
+      setMessages(prev => [...prev, { role: "assistant", content: "" }]);
+
+      await sendChatStream(
         content,
+        (token) => {
+          setIsLoading(false); // Hide thinking once we start getting tokens
+          currentAssistantMessage += token;
+          setMessages(prev => {
+            const newMessages = [...prev];
+            const lastMessage = newMessages[newMessages.length - 1];
+            if (lastMessage.role === "assistant") {
+              lastMessage.content = currentAssistantMessage;
+            }
+            return newMessages;
+          });
+        },
+        (meta) => {
+          setMessages(prev => {
+            const newMessages = [...prev];
+            const lastMessage = newMessages[newMessages.length - 1];
+            if (lastMessage.role === "assistant") {
+              if (meta.citations) lastMessage.citations = meta.citations;
+              if (meta.latency) lastMessage.latency = meta.latency;
+              if (meta.suggested_questions) lastMessage.suggestedQuestions = meta.suggested_questions;
+            }
+            return newMessages;
+          });
+          if (meta.source_type) {
+            setEngineMode(meta.source_type);
+          }
+          if (meta.citations && Object.keys(meta.citations).length > 0) {
+            setActiveCitations(meta.citations);
+            setShowSources(true);
+          }
+        },
+        (title) => {
+          setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title } : s));
+        },
         history,
-        "test_advisor_user",
+        getUser()?.id || "unknown",
+
         sessionId,
         selectedDocumentIds.length > 0 ? selectedDocumentIds : undefined
       );
 
       // Update sessions list to reflect title change or updated_at
       loadSessions();
-      const assistantEntry: ChatEntry = {
-        role: "assistant",
-        content: res.answer,
-        citations: res.citations,
-        latency: res.latency_breakdown,
-        queryExecution: res.query_execution,
-        suggestedQuestions: res.suggested_questions,
-      };
-      setMessages((prev) => [...prev, assistantEntry]);
-
-      if (res.source_type) {
-        setEngineMode(res.source_type);
-      }
-
-      if (res.citations && Object.keys(res.citations).length > 0) {
-        setActiveCitations(res.citations);
-        setShowSources(true);
-      }
-    } catch {
+    } catch (err) {
+      console.error("Stream error:", err);
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: "Connection error. Ensure the backend is running on localhost:8000." },
@@ -237,11 +312,24 @@ export default function Index() {
     setDocuments((prev) =>
       prev.map((d) => (d.id === id ? { ...d, status } : d))
     );
+    // Auto-select document as soon as it becomes indexed
+    if (status === "indexed") {
+      setSelectedDocumentIds((prev) =>
+        prev.includes(id) ? prev : [...prev, id]
+      );
+    }
   }, []);
 
-  const handleDocumentDelete = useCallback((id: string) => {
-    setDocuments((prev) => prev.filter((d) => d.id !== id));
-    setSelectedDocumentIds((prev) => prev.filter((docId) => docId !== id)); // Also remove from selected
+  const handleDocumentDelete = useCallback(async (id: string) => {
+    try {
+      await deleteDocument(id);
+      setDocuments((prev) => prev.filter((d) => d.id !== id));
+      setSelectedDocumentIds((prev) => prev.filter((docId) => docId !== id)); // Also remove from selected
+      toast.success("Document deleted successfully");
+    } catch (err) {
+      console.error("Failed to delete document:", err);
+      toast.error("Failed to delete document");
+    }
   }, []);
 
   const handleToggleDocumentSelection = useCallback((id: string) => {
@@ -272,6 +360,12 @@ export default function Index() {
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
         selectedDocumentIds={selectedDocumentIds}
         onToggleDocumentSelection={handleToggleDocumentSelection}
+        folders={folders}
+        activeFolderId={activeFolderId}
+        onFolderSelect={setActiveFolderId}
+        onFolderCreate={handleFolderCreate}
+        onFolderDelete={handleFolderDelete}
+        onAssignFolder={handleAssignFolder}
       />
 
       <main className="flex-1 flex flex-col min-w-0 bg-background/50 relative">
@@ -305,39 +399,54 @@ export default function Index() {
               <span className="text-[10px] font-mono uppercase tracking-wider hidden sm:inline">Persona</span>
             </button>
             <ThemeToggle />
+            <UserProfile onOpenSettings={() => setShowSettings(true)} />
           </div>
         </header>
+
 
         <div ref={scrollRef} className="flex-1 scroll-stable px-6">
           <div className="max-w-3xl mx-auto divide-y divide-border">
             {messages.length === 0 && !isLoading && (
               <SuggestedQueries onSelect={handleSend} />
             )}
-            {messages.map((msg, i) => (
-              <div key={i} className="py-6">
-                <ChatMessage
-                  role={msg.role}
-                  content={msg.content}
-                  citations={msg.citations}
-                  latency={msg.latency}
-                  queryExecution={msg.queryExecution}
-                  onCitationClick={handleCitationClick}
-                />
-                {msg.role === "assistant" && msg.suggestedQuestions && msg.suggestedQuestions.length > 0 && (
-                  <div className="mt-4 flex flex-wrap gap-2 animate-in fade-in slide-in-from-bottom-2 duration-500 delay-300 fill-mode-both">
-                    {msg.suggestedQuestions.map((q, j) => (
-                      <button
-                        key={j}
-                        onClick={() => handleSend(q)}
-                        className="text-xs px-3 py-1.5 rounded-full border border-primary/20 bg-primary/5 text-primary hover:bg-primary/10 transition-colors"
-                      >
-                        {q}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
+            {(() => {
+              // Only show follow-up buttons on the last assistant message
+              const lastAssistantIdx = messages.reduce(
+                (last, m, i) => (m.role === "assistant" ? i : last),
+                -1
+              );
+              return messages.map((msg, i) => (
+                <div key={i} className="py-6">
+                  <ChatMessage
+                    role={msg.role}
+                    content={msg.content}
+                    citations={msg.citations}
+                    latency={msg.latency}
+                    queryExecution={msg.queryExecution}
+                    onCitationClick={handleCitationClick}
+                  />
+                  {msg.role === "assistant" && i === lastAssistantIdx && !isLoading && msg.suggestedQuestions && msg.suggestedQuestions.length > 0 && (
+                    <div className="mt-4 flex flex-col gap-3">
+                      <span className="label-mono flex items-center gap-2">
+                        <div className="h-px w-4 bg-border" />
+                        Follow-up Questions
+                      </span>
+                      <div className="flex flex-wrap gap-2 animate-in fade-in slide-in-from-bottom-2 duration-500 delay-300 fill-mode-both">
+                        {msg.suggestedQuestions.map((q, j) => (
+                          <button
+                            key={j}
+                            onClick={() => handleSend(q)}
+                            className="suggested-question-chip"
+                          >
+                            {q}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ));
+            })()}
             <AnimatePresence>
               {isLoading && <ThinkingIndicator />}
             </AnimatePresence>
@@ -355,17 +464,22 @@ export default function Index() {
       </main>
 
       <AnimatePresence>
-        {false && ( // Removed original standalone sources drawer since it's now in the sidebar
+        {showSources && (
           <motion.div
             initial={{ opacity: 0, x: 300 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 300 }}
-            className="fixed inset-y-0 right-0 w-80 bg-card border-l border-border shadow-2xl z-50 p-6"
+            className="h-full border-l border-border bg-card z-20"
           >
-            {/* ... */}
+            <SourcePanel
+              citations={activeCitations}
+              focusedCitation={focusedCitation}
+              onClose={() => setShowSources(false)}
+            />
           </motion.div>
         )}
       </AnimatePresence>
+
       <SourceViewer
         isOpen={!!viewingSource}
         onClose={() => setViewingSource(null)}
@@ -373,6 +487,7 @@ export default function Index() {
         documentName={viewingSource?.name || ""}
         citation={viewingSource?.citation || null}
       />
+
     </div>
   );
 }
