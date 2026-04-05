@@ -191,18 +191,23 @@ async def upsert_filings(pool: asyncpg.Pool, rows: list[dict]) -> int:
 # ── PORTFOLIO ───────────────────────────────────────────────────────────────
 
 async def upsert_portfolio_positions(pool: asyncpg.Pool, rows: list[dict]) -> int:
+    """
+    Upsert portfolio positions.
+    IMPORTANT: each row dict MUST include 'user_id' for multi-tenant isolation.
+    ON CONFLICT key: (user_id, symbol, account, date)
+    """
     query = """
         INSERT INTO portfolio_positions
-            (symbol, quantity, cost_basis, currency, account, date, source)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (account, symbol, date)
+            (user_id, symbol, quantity, cost_basis, currency, account, date, source)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (user_id, symbol, account, date)
         DO UPDATE SET
             quantity = EXCLUDED.quantity,
             cost_basis = EXCLUDED.cost_basis
     """
     args = [
         (
-            r["symbol"], r["quantity"], r["cost_basis"],
+            r["user_id"], r["symbol"], r["quantity"], r["cost_basis"],
             r["currency"], r["account"], r["date"],
             r["source"],
         )
@@ -210,3 +215,103 @@ async def upsert_portfolio_positions(pool: asyncpg.Pool, rows: list[dict]) -> in
     ]
     await pool.executemany(query, args)
     return len(rows)
+
+
+async def get_portfolio_positions_for_user(pool: asyncpg.Pool, user_id: str) -> list[dict]:
+    """Fetch all portfolio positions for a specific user (owner-scoped)."""
+    rows = await pool.fetch(
+        """
+        SELECT id, user_id, symbol, quantity, cost_basis, currency, account, date, source, created_at
+        FROM portfolio_positions
+        WHERE user_id = $1
+        ORDER BY date DESC, symbol ASC
+        """,
+        user_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def delete_portfolio_position(pool: asyncpg.Pool, user_id: str, symbol: str, account: str = "default") -> int:
+    """Delete a portfolio position by symbol+account for a specific user. Returns rows deleted."""
+    result = await pool.execute(
+        """
+        DELETE FROM portfolio_positions
+        WHERE user_id = $1 AND symbol = $2 AND account = $3
+        """,
+        user_id, symbol.upper(), account,
+    )
+    # asyncpg returns 'DELETE N' string
+    return int(result.split()[-1])
+
+
+# ── PROACTIVE INSIGHTS & PROFILES ──────────────────────────────────────────
+
+async def get_portfolio_positions(pool: asyncpg.Pool, user_id: str | None = None) -> list[dict]:
+    if user_id:
+        rows = await pool.fetch(
+            "SELECT symbol, quantity, cost_basis, currency, account "
+            "FROM portfolio_positions WHERE user_id = $1 "
+            "ORDER BY date DESC",
+            user_id
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT symbol, quantity, cost_basis, currency, account "
+            "FROM portfolio_positions "
+            "ORDER BY date DESC"
+        )
+    return [dict(r) for r in rows]
+
+async def get_latest_macro_indicators(pool: asyncpg.Pool) -> list[dict]:
+    rows = await pool.fetch(
+        "SELECT DISTINCT ON (series_id) series_id, date, value "
+        "FROM macro_series "
+        "ORDER BY series_id, date DESC"
+    )
+    return [dict(r) for r in rows]
+
+async def get_recent_insights(pool: asyncpg.Pool, user_id: str, limit: int = 5) -> list[dict]:
+    rows = await pool.fetch(
+        "SELECT id, insight_text, relevance_score, timestamp "
+        "FROM insights WHERE user_id = $1 "
+        "ORDER BY timestamp DESC LIMIT $2",
+        user_id, limit
+    )
+    return [dict(r) for r in rows]
+
+async def insert_insight(pool: asyncpg.Pool, user_id: str, text: str, score: float):
+    await pool.execute(
+        "INSERT INTO insights (user_id, insight_text, relevance_score) VALUES ($1, $2, $3)",
+        user_id, text, score
+    )
+
+async def get_user_profile(pool: asyncpg.Pool, user_id: str) -> dict | None:
+    row = await pool.fetchrow(
+        "SELECT * FROM user_profiles WHERE user_id = $1",
+        user_id
+    )
+    return dict(row) if row else None
+
+async def upsert_user_profile(pool: asyncpg.Pool, user_id: str, data: dict):
+    await pool.execute(
+        """
+        INSERT INTO user_profiles (
+            user_id, risk_tolerance, preferred_style, interests, past_queries, custom_persona, experience_level, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+            risk_tolerance = EXCLUDED.risk_tolerance,
+            preferred_style = EXCLUDED.preferred_style,
+            interests = EXCLUDED.interests,
+            past_queries = EXCLUDED.past_queries,
+            custom_persona = EXCLUDED.custom_persona,
+            experience_level = EXCLUDED.experience_level,
+            updated_at = NOW()
+        """,
+        user_id,
+        data.get("risk_tolerance", "medium"),
+        data.get("preferred_style", "deep"),
+        json.dumps(data.get("interests", [])),
+        json.dumps(data.get("past_queries", [])),
+        data.get("custom_persona"),
+        data.get("experience_level", "intermediate")
+    )

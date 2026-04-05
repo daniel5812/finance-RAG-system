@@ -12,6 +12,7 @@ from financial.routes.macro import router as macro_router
 from financial.routes.filings import router as filings_router
 from financial.routes.holdings import router as holdings_router
 from financial.routes.portfolio import router as portfolio_router
+from financial.routes.insights import router as insights_router
 
 # One combined router for main.py to include
 router = APIRouter()
@@ -21,3 +22,4 @@ router.include_router(macro_router)
 router.include_router(filings_router)
 router.include_router(holdings_router)
 router.include_router(portfolio_router)
+router.include_router(insights_router)

@@ -73,6 +73,23 @@ async def upsert(pinecone_index: Any, chunk_id: str, vector, text: str, role: st
     )
 
 
+async def delete_by_doc_id(pinecone_index: Any, doc_id: str):
+    """Delete all vectors matching a specific document ID."""
+    if not pinecone_index:
+        logger.warning(f"delete_by_doc_id skipped: Pinecone not connected (doc_id={doc_id})")
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: pinecone_index.delete(filter={"doc_id": {"$eq": doc_id}})
+        )
+        logger.info(f"Deleted Pinecone vectors for doc_id={doc_id}")
+    except Exception as e:
+        logger.error(f"Failed to delete Pinecone vectors for doc {doc_id}: {e}")
+
+
 async def get_stats(pinecone_index: Any) -> dict | None:
     """Get vector store stats (for health checks). Returns None on failure."""
     if not pinecone_index:

@@ -59,8 +59,29 @@ class ChatResponse(BaseModel):
     source_type: str
     latency_breakdown: Dict[str, float]
     query_execution: Optional[dict] = None
+    # Explainability fields
+    reasoning_summary: Optional[str] = None
+    confidence_level: Optional[Literal["low", "medium", "high"]] = None
 
 class UserSettings(BaseModel):
     user_id: str
     custom_persona: Optional[str] = None
+    updated_at: Optional[Any] = None
+
+class UserProfileUpdate(BaseModel):
+    risk_tolerance: Optional[Literal["low", "medium", "high"]] = None
+    preferred_style: Optional[Literal["simple", "deep"]] = None
+    experience_level: Optional[Literal["beginner", "intermediate", "expert"]] = None
+    custom_persona: Optional[str] = Field(None, max_length=500)
+    interests: Optional[List[str]] = Field(None, max_length=20)
+
+class UserProfileResponse(BaseModel):
+    user_id: str
+    risk_tolerance: str = "medium"
+    preferred_style: str = "deep"
+    experience_level: str = "intermediate"
+    custom_persona: Optional[str] = None
+    interests: List[str] = []
+    past_queries: List[str] = []
+    created_at: Optional[Any] = None
     updated_at: Optional[Any] = None

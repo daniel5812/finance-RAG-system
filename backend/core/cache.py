@@ -29,15 +29,18 @@ async def redis_set(key: str, value: dict, ttl: int = CACHE_TTL):
     await connections.redis_client.set(key, json.dumps(value), ex=ttl)
 
 
-def generate_cache_key(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
+def generate_cache_key(text: str, user_id: str | None = None) -> str:
+    """Generate a hash-based cache key, optionally scoped by user_id."""
+    h = hashlib.md5(text.encode()).hexdigest()
+    return f"cache:{user_id or 'global'}:{h}"
 
 
 # ── Embedding Cache ──
 
-async def cached_embed(text: str, loop) -> np.ndarray:
-    """Return embedding from Redis cache, or compute + cache it."""
-    cache_key = f"embed:{hashlib.md5(text.encode()).hexdigest()}"
+async def cached_embed(text: str, loop, user_id: str | None = None) -> np.ndarray:
+    """Return embedding from Redis cache, or compute + cache it (User-Scoped)."""
+    h = hashlib.md5(text.encode()).hexdigest()
+    cache_key = f"embed:{user_id or 'global'}:{h}"
     raw = await connections.redis_client.get(cache_key)
     if raw is not None:
         return np.array(json.loads(raw), dtype=np.float32)
@@ -100,12 +103,14 @@ async def semantic_cache_store(
 
 # ── Plan Cache (Router Decision Caching) ──
 
-async def plan_cache_lookup(vector: np.ndarray, role: str) -> dict | None:
+# ── Plan Cache (Router Decision Caching) ──
+
+async def plan_cache_lookup(vector: np.ndarray, role: str, owner_id: str | None = None) -> dict | None:
     """
     Look up a previously generated MultiQueryPlan using semantic similarity.
-    Target: Bypassing the 4s LLM Router.
+    Scoped by owner_id to prevent leakages.
     """
-    pc_key = f"plancache:{role}"
+    pc_key = f"plancache:{role}:{owner_id or 'global'}"
     raw = await connections.redis_client.get(pc_key)
     if raw is None:
         return None
@@ -119,9 +124,9 @@ async def plan_cache_lookup(vector: np.ndarray, role: str) -> dict | None:
             return entry["plan"]
     return None
 
-async def plan_cache_store(vector: np.ndarray, role: str, plan: dict):
-    """Store a router plan in the semantic cache."""
-    pc_key = f"plancache:{role}"
+async def plan_cache_store(vector: np.ndarray, role: str, plan: dict, owner_id: str | None = None):
+    """Store a router plan in the semantic cache (User-Scoped)."""
+    pc_key = f"plancache:{role}:{owner_id or 'global'}"
     raw = await connections.redis_client.get(pc_key)
     entries = json.loads(raw) if raw else []
     entries.append({"vector": vector.tolist(), "plan": plan})

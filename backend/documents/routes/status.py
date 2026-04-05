@@ -18,13 +18,21 @@ The client flow:
     3. POST /chat (with document_id)   → ask questions about the document
 """
 
-from typing import List
-from fastapi import APIRouter, HTTPException, Depends
+from typing import List, Optional
+from fastapi import APIRouter, HTTPException, Depends, Query
 import asyncpg
-from core.dependencies import get_db_pool
+from pydantic import BaseModel
+from core.dependencies import get_db_pool, get_current_user, get_pinecone
+from typing import Any
+import os
 
 from core.logger import get_logger
-from documents.crud import get_document_status as crud_get_document_status, get_user_documents as crud_get_user_documents
+from documents.crud import (
+    get_document_status as crud_get_document_status,
+    get_user_documents as crud_get_user_documents,
+    get_folder,
+    set_document_folder,
+)
 from documents.schemas import DocumentStatusResponse
 
 logger = get_logger(__name__)
@@ -37,13 +45,15 @@ router = APIRouter(prefix="/documents", tags=["documents"])
     summary="List all documents for a user",
 )
 async def list_documents(
-    owner_id: str = "test_advisor_user",
+    folder_id: Optional[int] = Query(None, description="Filter by folder ID"),
+    user_id: str = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(get_db_pool)
 ) -> List[DocumentStatusResponse]:
     """
-    List all documents belonging to the specified user.
+    List all documents belonging to the authenticated user.
+    Pass ?folder_id=<id> to filter by folder.
     """
-    rows = await crud_get_user_documents(pool, owner_id)
+    rows = await crud_get_user_documents(pool, user_id, folder_id=folder_id)
     return [
         DocumentStatusResponse(
             document_id=r["document_id"],
@@ -53,6 +63,7 @@ async def list_documents(
             status=r["status"],
             created_at=r["created_at"],
             updated_at=r["updated_at"],
+            folder_id=r.get("folder_id"),
         )
         for r in rows
     ]
@@ -65,6 +76,7 @@ async def list_documents(
 )
 async def get_document_status(
     document_id: str,
+    user_id: str = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(get_db_pool)
 ) -> DocumentStatusResponse:
     """
@@ -84,18 +96,24 @@ async def get_document_status(
             status_code=404,
             detail=f"Document '{document_id}' not found.",
         )
+    
+    if row["owner_id"] != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied to this document",
+        )
 
     logger.info(f"Status poll: document_id={document_id} status={row['status']}")
 
     return DocumentStatusResponse(
-        document_id=str(row["id"]),
+        document_id=str(row["document_id"]),
         owner_id=row["owner_id"],
         original_filename=row["original_filename"],
         file_size_bytes=row["file_size_bytes"],
         status=row["status"],
-        storage_path=row["storage_path"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        folder_id=row.get("folder_id"),
     )
 
 
@@ -105,12 +123,72 @@ async def get_document_status(
 )
 async def delete_document(
     document_id: str,
-    pool: asyncpg.Pool = Depends(get_db_pool)
+    user_id: str = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    pinecone_index: Any = Depends(get_pinecone)
 ):
-    """Delete a document from the system."""
+    """Delete a document (Ownership Verified)."""
+    row = await crud_get_document_status(pool, document_id)
+    if not row or row["owner_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+        
+    # 1. Delete associated vectors from Pinecone
+    try:
+        from rag.vector_store import delete_by_doc_id
+        await delete_by_doc_id(pinecone_index, document_id)
+    except Exception as e:
+        logger.error(f"Failed to delete Pinecone vectors for {document_id}: {e}")
+
+    # 2. Delete physical files
+    storage_path = row.get("storage_path")
+    if storage_path:
+        for suffix in ["", ".txt"]:
+            file_to_delete = f"{storage_path}{suffix}"
+            if os.path.exists(file_to_delete):
+                try:
+                    os.remove(file_to_delete)
+                    logger.info(f"Deleted physical file: {file_to_delete}")
+                except Exception as e:
+                    logger.error(f"Failed to delete physical file {file_to_delete}: {e}")
+        
+    # 3. Delete from database
     from documents.crud import delete_document as crud_delete_document
     await crud_delete_document(pool, document_id)
     return {"status": "deleted", "document_id": document_id}
+
+class SetFolderRequest(BaseModel):
+    folder_id: Optional[int] = None
+
+
+@router.patch(
+    "/{document_id}/folder",
+    summary="Assign or unassign a document to/from a folder",
+)
+async def set_document_folder_route(
+    document_id: str,
+    body: SetFolderRequest,
+    user_id: str = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Assign a document to a folder (or unassign by passing folder_id: null).
+    Validates both document and folder ownership.
+    """
+    row = await crud_get_document_status(pool, document_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    if row["owner_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+
+    if body.folder_id is not None:
+        folder = await get_folder(pool, folder_id=body.folder_id, owner_id=user_id)
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found.")
+
+    await set_document_folder(pool, document_id=document_id, folder_id=body.folder_id, owner_id=user_id)
+    logger.info(f"document_folder_set document_id={document_id} folder_id={body.folder_id} user={user_id}")
+    return {"status": "ok", "document_id": document_id, "folder_id": body.folder_id}
+
 
 @router.get(
     "/{document_id}/text",
@@ -118,12 +196,13 @@ async def delete_document(
 )
 async def get_document_text(
     document_id: str,
+    user_id: str = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(get_db_pool)
 ):
-    """Retrieve the full extracted text of a document."""
+    """Retrieve the full extracted text (Ownership Verified)."""
     row = await crud_get_document_status(pool, document_id)
-    if not row:
-        raise HTTPException(404, "Document not found")
+    if not row or row["owner_id"] != user_id:
+        raise HTTPException(403, "Access denied")
     
     storage_path = row["storage_path"]
     text_path = f"{storage_path}.txt"

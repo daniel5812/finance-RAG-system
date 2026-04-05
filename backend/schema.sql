@@ -11,6 +11,19 @@
 --   • Indexes on (symbol, date) for fast time-series queries
 -- ============================================================
 
+-- 0. Identity & Access Management
+CREATE TABLE IF NOT EXISTS users (
+    id              TEXT         PRIMARY KEY,   -- user_id / username
+    email           TEXT         UNIQUE,
+    hashed_password TEXT         NOT NULL,
+    full_name       TEXT,
+    is_active       BOOLEAN      DEFAULT TRUE,
+    is_admin        BOOLEAN      DEFAULT FALSE,
+    role            TEXT         NOT NULL DEFAULT 'user',
+    scopes          TEXT[]       NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
 -- 1. Daily OHLCV price data (stocks, ETFs, indices)
 CREATE TABLE IF NOT EXISTS prices (
     id          BIGSERIAL PRIMARY KEY,
@@ -113,6 +126,7 @@ ON CONFLICT DO NOTHING;
 -- 6. Portfolio positions (user holdings)
 CREATE TABLE IF NOT EXISTS portfolio_positions (
     id          BIGSERIAL PRIMARY KEY,
+    user_id     TEXT         NOT NULL,
     symbol      VARCHAR(20)  NOT NULL,
     quantity    NUMERIC(14,4) NOT NULL,
     cost_basis  NUMERIC(14,4),                 -- avg price paid per unit
@@ -122,7 +136,7 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
     source      VARCHAR(50)  NOT NULL DEFAULT 'manual',
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
-    UNIQUE (symbol, account, date)
+    UNIQUE (user_id, symbol, account, date)
 );
 CREATE INDEX IF NOT EXISTS idx_portfolio_symbol ON portfolio_positions (symbol, date);
 
@@ -142,13 +156,25 @@ CREATE TABLE IF NOT EXISTS raw_ingestion_log (
 CREATE INDEX IF NOT EXISTS idx_ingestion_provider ON raw_ingestion_log (provider, fetch_time);
 
 
--- 8. Document pipeline — uploaded financial documents (PDF-first)
+-- 8a. Document Folders (user-defined organization)
+CREATE TABLE IF NOT EXISTS document_folders (
+    id          BIGSERIAL    PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    owner_id    TEXT         NOT NULL,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (owner_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_document_folders_owner ON document_folders (owner_id);
+
+
+-- 8b. Document pipeline — uploaded financial documents (PDF-first)
 --
 -- Design notes:
 --   • UUID primary key: safe to expose to clients (non-sequential integers leak volume)
 --   • storage_path: local disk path today → S3 key tomorrow (change config, not schema)
 --   • status lifecycle: pending_processing → processing → completed | failed
 --   • owner_id: placeholder for real user identity (auth system comes later)
+--   • folder_id: optional, references document_folders; SET NULL on folder delete
 CREATE TABLE IF NOT EXISTS documents (
     id                  UUID         PRIMARY KEY,
     owner_id            TEXT         NOT NULL,
@@ -157,7 +183,85 @@ CREATE TABLE IF NOT EXISTS documents (
     file_size_bytes     BIGINT,
     storage_path        TEXT,                          -- local path or future S3 key
     status              TEXT         NOT NULL DEFAULT 'pending_processing',
+    summary             TEXT,                          -- AI-generated summary
+    key_topics          JSONB,                         -- AI-extracted topics
+    suggested_questions JSONB,                         -- AI-suggested follow-ups
+    folder_id           BIGINT       REFERENCES document_folders(id) ON DELETE SET NULL,
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents (owner_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_documents_folder ON documents (folder_id);
+
+
+-- 9. Proactive Insights
+CREATE TABLE IF NOT EXISTS insights (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         TEXT         NOT NULL,
+    insight_text    TEXT         NOT NULL,
+    relevance_score NUMERIC(3,2),               -- 0.0 to 1.0 (e.g., 0.85)
+    timestamp       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_insights_user ON insights (user_id, timestamp);
+
+
+-- 10. User Profiles (Evolutionary context)
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id         TEXT         PRIMARY KEY,
+    risk_tolerance  VARCHAR(20)  DEFAULT 'medium', -- low, medium, high
+    preferred_style VARCHAR(20)  DEFAULT 'deep',   -- simple, deep
+    interests       JSONB        DEFAULT '[]',     -- topics (e.g. ["inflation", "tech"])
+    past_queries    JSONB        DEFAULT '[]',     -- track history for personalization
+    custom_persona  TEXT,                          -- manual persona instructions
+    experience_level VARCHAR(20) DEFAULT 'intermediate', -- beginner, intermediate, expert
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- 11. Chat Sessions (Persistence)
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id                   UUID          PRIMARY KEY,
+    user_id              TEXT          NOT NULL,
+    title                TEXT          NOT NULL DEFAULT 'New Conversation',
+    conversation_summary TEXT,                        -- rolling LLM-generated summary of older messages
+    created_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON chat_sessions (user_id, updated_at);
+
+-- Migration: add conversation_summary to existing chat_sessions tables
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS conversation_summary TEXT;
+
+-- 12. Chat Messages (Session History)
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id                  BIGSERIAL     PRIMARY KEY,
+    session_id          UUID          NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role                VARCHAR(20)   NOT NULL,         -- user / assistant / system
+    content             TEXT          NOT NULL,
+    citations           JSONB         DEFAULT '{}',
+    latency             JSONB         DEFAULT '{}',
+    suggested_questions JSONB         DEFAULT '[]',
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages (session_id, created_at);
+
+-- Migration: add suggested_questions to existing chat_messages tables
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS suggested_questions JSONB DEFAULT '[]';
+
+
+-- 13. Audit Events (RBAC audit trail)
+CREATE TABLE IF NOT EXISTS audit_events (
+    id              BIGSERIAL    PRIMARY KEY,
+    event_type      TEXT         NOT NULL,          -- login, chat, admin_action, error
+    user_id         TEXT,
+    timestamp       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    resource_id     TEXT,                            -- optional (doc_id, session_id)
+    action          TEXT         NOT NULL,           -- read, write, update, delete
+    status          TEXT         NOT NULL,           -- success, failure
+    request_id      TEXT,
+    metadata        JSONB        DEFAULT '{}',
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_events (user_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_events (event_type, timestamp);

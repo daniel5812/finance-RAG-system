@@ -8,6 +8,7 @@ This enforces consistency. When you add a new data source,
 you implement 3 methods and get retry, logging, and provenance for free.
 """
 
+import json
 import traceback
 from abc import ABC, abstractmethod
 from datetime import datetime

@@ -56,6 +56,12 @@ class BOIProvider(BaseProvider):
 
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(_BOI_URL, params=params)
+            
+            # The BOI SDMX API returns 404 when there is no data for the requested dates
+            # (e.g., weekends or holidays). We treat this gracefully.
+            if resp.status_code == 404:
+                return "DATA_TYPE,UNIT_MEASURE,BASE_CURRENCY,OBS_VALUE,UNIT_MULT,TIME_PERIOD\n"
+                
             resp.raise_for_status()
 
         return resp.text

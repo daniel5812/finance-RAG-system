@@ -5,8 +5,9 @@ import functools
 import asyncio
 from contextvars import ContextVar
 
-# ── Request ID Context — propagated across threads/tasks ──
+# ── Request ID & User Context — propagated across threads/tasks ──
 request_id_var: ContextVar[str] = ContextVar("request_id", default="none")
+user_id_var: ContextVar[str] = ContextVar("user_id", default="none")
 
 class StructuredFormatter(logging.Formatter):
     """Outputs logs as single-line JSON for machine parsing."""
@@ -16,6 +17,7 @@ class StructuredFormatter(logging.Formatter):
             "level": record.levelname,
             "module": record.name,
             "request_id": request_id_var.get(),
+            "user_id": user_id_var.get(),
             "event": record.getMessage(),
         }
         return json.dumps(log_entry, ensure_ascii=False)

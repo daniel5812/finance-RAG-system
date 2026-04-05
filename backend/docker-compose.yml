@@ -45,6 +45,7 @@ services:
       postgres:
         condition: service_healthy
     volumes:
+      - .:/app
       - uploads:/app/uploads
     healthcheck:
       test: [ "CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'" ]

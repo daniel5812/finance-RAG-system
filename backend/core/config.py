@@ -18,8 +18,15 @@ INDEX_NAME = "rag-384"
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = 6379
 
+# ── Authentication ──
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-me")
+ALGORITHM = "HS256"
+
 # ── PostgreSQL ──
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://rag:rag@localhost:5432/investdb")
+
 
 # ── Cache TTLs ──
 CACHE_TTL = 600           # Hard expiration (10 min) — enforced by Redis ex=
@@ -27,7 +34,7 @@ CACHE_SOFT_TTL = 240      # Soft expiration (4 min) — checked application-side
 EMBED_CACHE_TTL = 3600    # Embedding cache (1 hour)
 
 # ── Semantic Cache ──
-SEMANTIC_CACHE_THRESHOLD = 0.95   # cosine similarity threshold
+SEMANTIC_CACHE_THRESHOLD = 0.88   # cosine similarity threshold
 SEMANTIC_CACHE_MAX = 100          # max entries per role
 
 # ── Dynamic Retrieval ──
@@ -58,6 +65,12 @@ ROLE_ACCESS = {
     "admin":    ["public", "admin"],
     "employee": ["public"],
 }
+
+# ── Rate Limiting ──
+# Per-user sliding window: max requests allowed per 60-second window.
+# An SPA fires ~6 requests per page load; 200 allows ~33 page loads/min
+# before throttling, which is sufficient for normal use.
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "200"))
 
 # ── Document Pipeline ──
 # DOCUMENT_UPLOAD_DIR: where uploaded PDFs are saved on disk.

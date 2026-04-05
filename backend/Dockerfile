@@ -2,25 +2,30 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 
+ENV PIP_DEFAULT_TIMEOUT=1000
 
 # 2. Work Directory - איפה נעבוד בתוך המכולה
 WORKDIR /app
 
-# 3. Copy Dependencies - מעתיקים קודם את רשימת הספריות (כדי לנצל Cache)
-COPY requirements.txt .
+# 3. Base ML Dependencies - (Heavy layers, cached separately)
+# We do this BEFORE requirements.txt so that adding a small library doesn't trigger a 1GB re-download.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
-# 4a. Install PyTorch CPU-only (layer cached separately - won't re-download)
+RUN pip install --upgrade pip
+
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch --index-url https://download.pytorch.org/whl/cpu
+    pip install --retries 10 torch sentence-transformers --extra-index-url https://download.pytorch.org/whl/cpu
 
-# 4b. Install remaining dependencies (torch already satisfied from step 4a)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-
-# 4c. Pre-download ML models used in core.connections
 RUN python -c "from sentence_transformers import SentenceTransformer, CrossEncoder; \
     SentenceTransformer('all-MiniLM-L6-v2'); \
     CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+
+# 4. App Dependencies
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
 # 5. Copy Code - מעתיקים את שאר הקוד שלנו (main.py) פנימה
 COPY . .

@@ -4,7 +4,7 @@ New models are added here as each stage is implemented.
 """
 
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, field_validator
 
 
@@ -58,4 +58,5 @@ class DocumentStatusResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     storage_path: str | None = None   # only exposed for debugging; hide in production
+    folder_id: Optional[int] = None
 

@@ -21,6 +21,7 @@ from core.logger import get_logger
 from documents.worker import process_document_worker
 from financial.providers.fx import BOIProvider
 from financial.providers.holdings import HoldingsProvider
+from financial.services.proactive_insights_service import ProactiveInsightEngine
 
 logger = get_logger("worker")
 
@@ -69,6 +70,11 @@ async def scheduler_loop():
                 # Push Holdings task
                 await redis_client.rpush("tasks:financial_ingestion", json.dumps({
                     "type": "holdings_ingestion"
+                }))
+                
+                # Push Proactive Insights task
+                await redis_client.rpush("tasks:financial_ingestion", json.dumps({
+                    "type": "proactive_insights"
                 }))
                 
         except Exception as e:
@@ -135,6 +141,9 @@ async def _handle_financial_ingestion(pool, task):
         elif task_type == "holdings_ingestion":
             provider = HoldingsProvider()
             await provider.ingest(pool)
+            
+        elif task_type == "proactive_insights":
+            await ProactiveInsightEngine.run_periodic_check(pool)
             
         logger.info(f"Financial ingestion complete: {task_type}")
     except Exception as e:

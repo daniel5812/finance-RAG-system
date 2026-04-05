@@ -39,3 +39,27 @@ class FilingsIngestRequest(BaseModel):
         examples=["AAPL", "MSFT", "GOOGL"],
     )
     filing_types: list[str] = Field(default=["10-K", "10-Q"])
+
+
+# ── Portfolio Management ─────────────────────────────────────────────────────
+
+class PortfolioPositionCreate(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+    quantity: float = Field(..., gt=0)
+    cost_basis: float | None = Field(default=None, ge=0)
+    currency: str = Field(default="USD", max_length=3)
+    account: str = Field(default="default", max_length=50)
+    date: date
+
+
+class PortfolioPositionResponse(BaseModel):
+    id: int
+    user_id: str
+    symbol: str
+    quantity: float
+    cost_basis: float | None
+    currency: str
+    account: str
+    date: date
+    source: str
+    created_at: date | None = None

@@ -23,10 +23,10 @@ from pathlib import Path
 
 import aiofiles
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Header, HTTPException, UploadFile, File, Depends
+from fastapi import APIRouter, Header, HTTPException, UploadFile, File, Depends, Form
 import asyncpg
-from core.dependencies import get_db_pool, get_redis
-from typing import Any
+from core.dependencies import get_db_pool, get_redis, get_current_user
+from typing import Any, Optional
 from fastapi.responses import JSONResponse
 
 import core.db as db
@@ -130,11 +130,9 @@ async def _read_and_validate_file(
 )
 async def upload_document(
     file: UploadFile = File(..., description="PDF file to upload"),
-    x_owner_id: str = Header(
-        ...,
-        alias="X-Owner-Id",
-        description="ID of the user uploading the document.",
-    ),
+    folder_id: Optional[int] = Form(None, description="Optional folder ID"),
+    document_id: Optional[str] = Form(None, description="Optional frontend-generated ID"),
+    user_id: str = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(get_db_pool),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> JSONResponse:
@@ -159,32 +157,39 @@ async def upload_document(
     file_bytes, file_size = await _read_and_validate_file(file)
 
     # ── 3. Generate document identity ──────────────────────────────────────
-    document_id = str(uuid.uuid4())
+    document_id = document_id or str(uuid.uuid4())
 
     # ── 4. Persist to disk ─────────────────────────────────────────────────
     upload_dir = _ensure_upload_dir()
-    storage_path = str(upload_dir / f"{document_id}.pdf")
+    _ALLOWED_EXTENSIONS = {".pdf", ".txt"}
+    raw_ext = Path(original_filename).suffix.lower()
+    file_ext = raw_ext if raw_ext in _ALLOWED_EXTENSIONS else ".pdf"
+    storage_path = str(upload_dir / f"{document_id}{file_ext}")
 
     async with aiofiles.open(storage_path, "wb") as f:
         await f.write(file_bytes)
 
+    # Use user_id from auth
+    owner_id = user_id
+
     # ── 5. Insert metadata into DB ──────────────────────────────────────────
-    content_type = "application/pdf" if original_filename.lower().endswith(".pdf") else "text/plain"
+    content_type = file.content_type or "application/pdf"
     await create_document(
         pool,
         document_id=document_id,
-        owner_id=x_owner_id,
-        original_filename=original_filename,
+        owner_id=owner_id,
+        original_filename=file.filename or "unknown.pdf",
         content_type=content_type,
         file_size_bytes=file_size,
         storage_path=storage_path,
+        folder_id=folder_id,
     )
 
     # ── 6. Structured log ───────────────────────────────────────────────────
     logger.info(json.dumps({
         "event": "document_accepted",
         "document_id": document_id,
-        "owner_id": x_owner_id,
+        "owner_id": owner_id,
         "original_filename": original_filename,
         "file_size_bytes": file_size,
     }))
@@ -193,7 +198,7 @@ async def upload_document(
     task = {
         "document_id": document_id,
         "file_path": storage_path,
-        "owner_id": x_owner_id,
+        "owner_id": owner_id,
     }
     await redis.rpush("tasks:document_indexing", json.dumps(task))
 

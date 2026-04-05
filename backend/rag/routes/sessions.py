@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
+from core.dependencies import get_current_user
 from typing import List
 from uuid import uuid4, UUID
 from rag.schemas import ChatSession, ChatMessagesResponse
@@ -10,7 +11,7 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/chat/sessions", tags=["chat"])
 
 @router.post("/", response_model=ChatSession)
-async def create_session(user_id: str, pool: asyncpg.Pool = Depends(db.get_pool)):
+async def create_session(user_id: str = Depends(get_current_user), pool: asyncpg.Pool = Depends(db.get_pool)):
     """Start a new chat session."""
     session_id = str(uuid4())
     try:
@@ -27,9 +28,9 @@ async def create_session(user_id: str, pool: asyncpg.Pool = Depends(db.get_pool)
         logger.error(f"Failed to create session: {e}")
         raise HTTPException(500, "Database error")
 
-@router.get("/{user_id}", response_model=List[ChatSession])
-async def list_sessions(user_id: str, pool: asyncpg.Pool = Depends(db.get_pool)):
-    """List all chat sessions for a user."""
+@router.get("/", response_model=List[ChatSession])
+async def list_sessions(user_id: str = Depends(get_current_user), pool: asyncpg.Pool = Depends(db.get_pool)):
+    """List all chat sessions for the authenticated user."""
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -48,28 +49,49 @@ async def list_sessions(user_id: str, pool: asyncpg.Pool = Depends(db.get_pool))
         raise HTTPException(500, "Database error")
 
 @router.get("/{session_id}/messages", response_model=ChatMessagesResponse)
-async def get_session_messages(session_id: str, pool: asyncpg.Pool = Depends(db.get_pool)):
-    """Fetch all messages for a specific session."""
+async def get_session_messages(
+    session_id: str, 
+    user_id: str = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(db.get_pool)
+):
+    """Fetch all messages for a specific session (Ownership Verified)."""
     try:
         async with pool.acquire() as conn:
+            # Verify ownership first
+            owner = await conn.fetchval("SELECT user_id FROM chat_sessions WHERE id = $1", UUID(session_id))
+            if not owner or owner != user_id:
+                raise HTTPException(status_code=403, detail="Access denied to this session")
             rows = await conn.fetch(
-                "SELECT role, content, citations, latency, created_at FROM chat_messages "
+                "SELECT role, content, citations, latency, suggested_questions, created_at FROM chat_messages "
                 "WHERE session_id = $1 ORDER BY created_at ASC",
                 UUID(session_id)
             )
             # Convert citations/latency from JSONB to dict explicitly if needed
             return ChatMessagesResponse(messages=[dict(r) for r in rows])
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to fetch messages: {e}")
         raise HTTPException(500, "Database error")
 
 @router.delete("/{session_id}")
-async def delete_session(session_id: str, pool: asyncpg.Pool = Depends(db.get_pool)):
-    """Delete a chat session."""
+async def delete_session(
+    session_id: str, 
+    user_id: str = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(db.get_pool)
+):
+    """Delete a chat session (Ownership Verified)."""
     try:
         async with pool.acquire() as conn:
+            # Verify ownership
+            owner = await conn.fetchval("SELECT user_id FROM chat_sessions WHERE id = $1", UUID(session_id))
+            if not owner or owner != user_id:
+                raise HTTPException(status_code=403, detail="Access denied")
+
             await conn.execute("DELETE FROM chat_sessions WHERE id = $1", UUID(session_id))
             return {"status": "deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to delete session: {e}")
         raise HTTPException(500, "Database error")

@@ -19,3 +19,6 @@ python-dateutil
 aiofiles           # async file I/O — used in documents/routes.py for non-blocking disk writes
 python-multipart   # required by FastAPI to parse multipart/form-data (UploadFile)
 pypdf              # PDF text extraction — used in documents/worker.py (Stage 3)
+python-jose[cryptography]
+google-auth
+passlib[bcrypt]
