@@ -1,179 +1,290 @@
 # 🧠 AI Investment Intelligence Engine
 
-A decision-intelligence system for structured financial analysis and document-aware retrieval (RAG).
+A production-grade **Investment Intelligence System** for structured financial analysis, document-aware retrieval (RAG), and deterministic decision support.
 
-This system ingests market data, macro indicators, FX rates, ETF holdings, SEC filings, and user portfolio positions — then enables analytical insights, scenario simulations, and explainable decision-support outputs through an advanced multi-tenant RAG, caching, and routing architecture.
+This system ingests market data, macro indicators, FX rates, ETF holdings, SEC filings, and user portfolio positions — then transforms them into **scored, explainable investment insights and recommendations**.
 
-❗ **This is NOT a trading bot or automated investing system.**
-It is an analytical intelligence layer.
+❗ This is NOT a trading bot or automated investing system.  
+It is a **decision-intelligence layer** designed for analysis, reasoning, and explainability.
 
 ---
 
 ## 📦 Project Overview
 
-The system consists of:
-- **FastAPI backend** (horizontally scaled via Nginx load balancer)
-- **PostgreSQL** (relational financial data & document metadata storage)
-- **Redis** (layered semantic caching, rate limiting, and exact-match cache)
-- **Pinecone** (vector store for document embeddings)
-- **OpenAI** (LLM for generation, chunk embedding, and intelligent query routing)
+The system is composed of:
+
+- **FastAPI backend** (stateless, horizontally scalable via NGINX)
+- **PostgreSQL** (financial data, portfolio, metadata)
+- **Redis** (semantic caching, rate limiting)
+- **Pinecone** (vector embeddings for document search)
+- **OpenAI** (LLM used strictly for explanation and synthesis)
 - **Dockerized infrastructure** (multi-container orchestration)
 
 ---
 
 ## 🏗 Architecture
 
-```text
-       [  Incoming API Requests  ]
-                 │
-                 ▼
-       ┌───────────────────┐
-       │ NGINX Load Balancer │
-       └───────────────────┘
-                 │
-       ┌─────────┴─────────┐
-       ▼                   ▼
-  ┌─────────┐         ┌─────────┐
-  │ FastAPI │   ...   │ FastAPI │ (Horizontally Scaled)
-  │  Node 1 │         │  Node N │
-  └─────────┘         └─────────┘
-       │                   │
- ┌─────┼───────────────────┼─────┐
- │     ▼                   ▼     │
- │  ┌─────┐   ┌───────┐ ┌─────┐  │
- │  │Redis│   │Pinecone││  DB  │  │ (Shared State Layer)
- │  └─────┘   └───────┘ └─────┘  │
- └───────────────────────────────┘
-```
 
-The API layer is strictly stateless. All persistent state and caching live in PostgreSQL, Redis, or Pinecone, ensuring perfect horizontal scalability and tenant isolation. Requests are fully traceable across the system using correlation IDs.
+User Query
+↓
+Query Planner (router.py)
+↓
+SQL + Vector Retrieval (parallel)
+↓
+Investment Intelligence Layer
+↓
+LLM Explanation Layer
+↓
+Final Response
+
+
+The API layer is strictly **stateless**.  
+All state is externalized (Postgres, Redis, Pinecone), enabling horizontal scaling and strict tenant isolation.
 
 ---
 
-## 🚀 Key Features and Pipelines
+## 🧠 Core Innovation: Investment Intelligence Layer
 
-### 1️⃣ Document RAG Pipeline (Multi-Tenant)
-A secure multi-tenant retrieval-augmented generation engine natively integrated with individual user workspaces.
+The system has evolved from a classic RAG pipeline into a **structured reasoning engine**.
 
-1. **Ingestion & Indexing:** 
-   - PDF uploads are processed by background workers.
-   - Flow: `Extract Text` → `Chunk` → `Embed (MiniLM)` → `Upsert to Pinecone`
-   - Metadata (`owner_id`, `document_id`) strictly segregates tenant data.
-   
-2. **Intelligent Query Routing & Multi-Source Synthesis (Stage 9):**
-   - User queries are intercepted by a specialized routing LLM.
-   - **Compound Query Decomposition**: Multi-part questions (e.g., "Check SPY holdings AND USD rate") are broken into a `MultiQueryPlan`.
-   - **Concurrent Retrieval**: SQL queries (Structured) and Vector searches (Unstructured) are executed in parallel (`asyncio.gather`) for minimum latency.
-   - **Secure SQL Tool**: Optimized financial queries are executed against a hardened PostgreSQL engine with strict read-only and table-whitelist guardrails.
-   - **Context Fusion**: Structured data and textual chunks are merged into a unified analytical context before synthesis.
-   - Built-in guardrails detect and retry LLM hallucinations before execution.
+### Full Pipeline
 
-### 2️⃣ Layered Semantic Caching
-Advanced caching mechanisms to minimize latency and AI costs:
-1. **Exact-Match Cache:** Instantly returns answers for identical queries.
-2. **Embedding Cache:** Avoids re-encoding identical query strings.
-3. **Semantic Cache:** Uses vector similarity to detect *conceptually* identical queries (e.g. "What is my 2024 return?" vs "How much did my portfolio make this year?") and returns cached answers if similarity crosses a rigorous threshold. **Note**: Caches are strictly partitioned by `owner_id`.
 
-### 3️⃣ Data Ingestion Model (Structured Data)
-All external data sources follow a resilient provider pipeline (`fetch_raw` → `normalize` → `validate via Pydantic` → `store` → `provenance log`).
-- **Idempotency:** Re-running pipelines ignores existing records (ON CONFLICT DO NOTHING).
-- **Extensible Providers:** Existing providers include Bank of Israel (FX rates), Yahoo Finance (ETF Holdings), FRED (Macro), and more.
+Retrieval → Normalization → Agents → Scoring → Recommendation → Validation → LLM
+
+
+### Agents
+
+- **UserProfilerAgent**
+  - Builds structured user investment profile (risk, behavior, preferences)
+
+- **MarketAnalyzerAgent**
+  - Classifies macro regime (interest rates, inflation, economic signals)
+
+- **AssetProfilerAgent**
+  - Profiles stocks and ETFs using price data and holdings
+
+- **ScoringEngineAgent (Deterministic)**
+  - Computes composite score:
+    - 30% market fit
+    - 25% user fit
+    - 20% diversification
+    - 25% risk alignment
+
+- **PortfolioFitAgent**
+  - Uses normalized portfolio
+  - Computes concentration (HHI based on invested value, not row count)
+
+- **RecommendationAgent**
+  - Outputs: BUY / HOLD / REDUCE / AVOID
+  - Fully deterministic decision
+  - LLM generates explanation only
+
+- **ValidationAgent (Critical Layer)**
+  - Ensures:
+    - score consistency
+    - action correctness
+    - confidence validity
+  - Can downgrade confidence if inconsistencies are detected
 
 ---
 
-## 📊 Structured Data Types
+## ⚙️ Data Normalization Layer
 
-### 1. Prices (Market Data)
-- **Purpose:** Daily stock / ETF / index price history.
-- **Use Cases:** Returns calculation, volatility, drawdown.
+Located at: `backend/intelligence/data_normalizer.py`
 
-### 2. FX Rates (Currency Data)
-- **Purpose:** Exchange rate normalization for cross-currency portfolios.
-- **Provider:** Bank of Israel API.
+Transforms raw DB rows into canonical structured signals:
 
-### 3. Macro Series (Economic Indicators)
-- **Purpose:** Macroeconomic context (Yield curves, Inflation, GDP).
-- **Use Cases:** Interest rate sensitivity, regime detection.
+- `total_invested = SUM(quantity × cost_basis)`
+- `allocation_pct` per ticker
 
-### 4. ETF Holdings
-- **Purpose:** Decompose ETF exposure.
-- **Use Cases:** Sector exposure, indirect stock exposure, concentration analysis.
+This prevents:
+- confusion between balances and deposits
+- incorrect interpretation of exposure vs performance
+- LLM miscalculations
 
-### 5. Portfolio Positions
-- **Purpose:** User-specific holdings.
-- **Use Cases:** Portfolio valuation, risk analysis.
+---
 
-### 6. SEC Filings (Fundamentals)
-- **Purpose:** Company fundamental financial data (10-K, 10-Q, 8-K).
-- **Use Cases:** Revenue growth analysis, margin tracking, risk factor extraction.
+## 🧾 Structured Context Blocks
+
+The LLM receives only structured, precomputed signals:
+
+### `[NORMALIZED PORTFOLIO]`
+- total invested capital
+- allocation per asset
+- dominant exposure
+
+### `[VALIDATION]`
+- detected inconsistencies
+- confidence adjustments
+
+These blocks ensure the LLM operates on **trusted data only**.
+
+---
+
+## 🔒 LLM Constraints (Critical Design)
+
+The LLM is tightly controlled and **not allowed to make decisions**.
+
+### 🚫 Forbidden:
+- performing arithmetic (no calculations)
+- deriving totals or percentages
+- inventing financial numbers
+- overriding system recommendations
+- inventing confidence levels
+
+### ✅ Allowed:
+- explanation
+- synthesis
+- structured reasoning
+
+All decisions come from deterministic system components.
+
+---
+
+## 🔍 Query Planning & Retrieval
+
+### Multi-Source Planner (`router.py`)
+
+- LLM outputs **intent JSON only**
+- SQL queries are built deterministically in Python
+- Supports:
+  - structured queries (SQL)
+  - unstructured queries (vector search)
+- Full Hebrew and English support
+
+### Retrieval Strategy
+
+- SQL and vector queries run in parallel (`asyncio.gather`)
+- Cross-encoder reranker improves relevance
+- Results are merged into a unified context
+
+---
+
+## 📊 Data Sources
+
+### Structured Data (PostgreSQL)
+
+- Prices (stocks, ETFs)
+- FX rates (Bank of Israel)
+- Macro indicators (FRED)
+- ETF holdings (Yahoo Finance)
+- Portfolio positions
+- SEC filings
+
+### Unstructured Data
+
+- User-uploaded documents → embedded in Pinecone
+
+---
+
+## ⚡ Semantic Caching
+
+Three caching layers:
+
+- Exact-match cache
+- Embedding cache
+- Semantic similarity cache
+
+All caches are strictly **tenant-isolated (owner_id)**.
 
 ---
 
 ## 🔒 Security & Data Integrity
-1. **Tenant Isolation:** All document processing, vector querying, and semantic caching are strictly bound by an `owner_id`. Cross-tenant data leakage is structurally impossible.
-2. **Pydantic Validation:** All incoming data (APIs, Webhooks, scraping) passes through strict schema validation before DB insertion.
-3. **Unique Constraints & Hashing:** Prevents duplicate ingestion. Auditing hashes (SHA256) detect altered source content.
-4. **Prompt Injection Protection:** Inputs are validated against heuristics and injection patterns before reaching the LLMs.
+
+- Strict multi-tenant isolation (owner_id enforced everywhere)
+- Read-only SQL layer with table whitelist
+- Pydantic validation on all ingested data
+- Prompt injection protection (`security.py`)
+- No direct LLM calls outside controlled pipeline
+
+---
+
+## 📁 Document Pipeline
+
+
+Upload → Extract → Chunk → Embed → Pinecone
+
+
+- 500-character chunks (50 overlap)
+- owner_id-based isolation
+- async worker-based ingestion
+
+---
+
+## 🔁 Chat Flow (End-to-End)
+
+
+User Query
+→ Cache check
+→ Router (intent classification)
+→ SQL + Vector retrieval
+→ Context fusion
+
+→ Investment Intelligence Layer:
+User profiling
+Market analysis
+Asset profiling
+Portfolio fit
+Scoring (deterministic)
+Recommendation (deterministic)
+Validation (final guardrail)
+
+→ LLM synthesis (explanation only)
+→ Response
+
+
+---
+
+## 🧪 Observability & Debugging
+
+Every request is tagged with a unique `X-Request-ID`.
+
+### Backend Logs
+
+
+docker logs -f ml_foundations-api-1
+docker logs ml_foundations-api-1 | grep "router_decision"
+
+
+### Performance Metrics
+
+The frontend displays:
+- Planning time
+- Retrieval time
+- Generation time
 
 ---
 
 ## 🏁 Design Principles
-- **Stateless API:** Easy to horizontally scale.
-- **Externalized State:** Postgres + Redis + Pinecone.
-- **Provider Abstraction:** Easily add new data sources.
-- **Resiliency & Guardrails:** Retry mechanisms on LLM calls, robust LLM schema enforcement (json_object + validation).
+
+- Deterministic decision-making (no LLM guessing)
+- Explainable AI (transparent reasoning)
+- Stateless architecture (horizontally scalable)
+- Multi-tenant safety by design
+- Fail-safe outputs (no hallucinations)
 
 ---
 
-## 🚦 Getting Started
+## 🚧 Known Limitations
 
-### 1️⃣ Backend (Docker)
-The backend runs in a robust multi-tenant Docker environment.
-```bash
-cd ml_foundations
-docker-compose up -d --build
-```
-- **API URL**: `http://localhost:8000`
-- **Health Check**: `http://localhost:8000/health`
-- **Interactive API Docs**: `http://localhost:8000/docs`
-
-### 2️⃣ Frontend (React)
-The frontend provides a premium analytical chat interface.
-```bash
-cd ../insight-ledger
-npm install
-npm run dev
-```
-- **UI URL**: `http://localhost:5173`
+- Returns / P&L cannot be computed without live market prices
+- Sector classification is not yet available
+- Limited macro series coverage (FRED)
+- Hebrew ticker mapping requires explicit symbol input
 
 ---
 
-## 🔍 Observability & Logs
+## 🚀 Roadmap
 
-The system is designed for deep tracing. Every request carries a unique `X-Request-ID`.
-
-### 📱 Backend Logs
-To see real-time AI logic, routing decisions, and SQL execution:
-```bash
-# All logs
-docker logs -f ml_foundations-api-1
-
-# Specific filters (e.g., search for router decisions)
-docker logs ml_foundations-api-1 | grep "router_decision"
-```
-
-### 🧠 Performance Metrics
-In the **Frontend**, use the built-in **Latency Bar** (below each AI message) to see:
-- **Planning**: Time spent in the Heuristic / LLM Router.
-- **Retrieval**: SQL and Vector execution time.
-- **Generation**: LLM synthesis time.
-
-### 📁 Document Processing
-Monitor the ingestion queue:
-```bash
-docker logs -f ml_foundations-worker-1
-```
+- Live price enrichment (enable real P&L calculations)
+- Sector classification layer
+- Market sentiment integration
+- Observability dashboard (debug UI)
+- Automated evaluation suite
 
 ---
 
-*Disclaimer: This system provides analytical decision support. It does not provide investment advice.*
+## 👤 Author
+
+Daniel Dahan
