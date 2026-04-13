@@ -265,3 +265,69 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_events (user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_events (event_type, timestamp);
+
+
+-- ============================================================
+-- 14. Observability — Structured Trace System
+-- ============================================================
+
+-- 14a. Per-request summary (one row per HTTP request)
+--   Durable record of what happened at the rolled-up level.
+--   Individual stage events live in Redis (TTL 24h) keyed as trace:{req_id}.
+CREATE TABLE IF NOT EXISTS observability_request_runs (
+    req_id                       TEXT         PRIMARY KEY,
+    user_id                      TEXT,
+    path                         TEXT,
+    method                       TEXT,
+    status_code                  INTEGER,
+    total_latency_ms             NUMERIC(10,2),
+    stage_count                  INTEGER      DEFAULT 0,
+    error_count                  INTEGER      DEFAULT 0,
+    cache_hit                    BOOLEAN      DEFAULT FALSE,
+    cache_type                   TEXT,                        -- exact | semantic | stale | NULL
+    intent                       TEXT,
+    intelligence_confidence      TEXT,                        -- high | medium | low | NULL
+    llm_behavior_classification  TEXT,                        -- followed_system | deviated | added_unsupported_claims
+    sources_retrieved            INTEGER      DEFAULT 0,
+    timestamp                    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_obs_runs_ts   ON observability_request_runs (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_runs_user ON observability_request_runs (user_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_runs_behavior ON observability_request_runs (llm_behavior_classification, timestamp DESC);
+
+-- Migration: add request_type classification column
+ALTER TABLE observability_request_runs ADD COLUMN IF NOT EXISTS request_type TEXT DEFAULT 'user';
+CREATE INDEX IF NOT EXISTS idx_obs_runs_type ON observability_request_runs (request_type, timestamp DESC);
+
+-- 14b. Categorized error events (persisted separately for fast error triage)
+--   Also appended to Redis trace list for timeline continuity.
+CREATE TABLE IF NOT EXISTS observability_errors (
+    id              BIGSERIAL    PRIMARY KEY,
+    req_id          TEXT         NOT NULL,
+    stage           TEXT         NOT NULL,
+    error_category  TEXT         NOT NULL,   -- INFRA | PIPELINE | DATA | BUSINESS | SECURITY
+    error_code      TEXT         NOT NULL,   -- machine-readable e.g. "VECTOR_RETRIEVAL_TIMEOUT"
+    message         TEXT         NOT NULL,
+    traceback       TEXT,
+    data            JSONB        DEFAULT '{}',
+    timestamp       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_obs_errors_ts       ON observability_errors (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_errors_category ON observability_errors (error_category, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_errors_req      ON observability_errors (req_id);
+
+-- 14c. LLM introspection traces
+--   One row per request where the intelligence layer ran.
+--   Answers: what did the LLM see? did it follow the rules?
+CREATE TABLE IF NOT EXISTS observability_llm_traces (
+    req_id           TEXT         PRIMARY KEY,
+    input_blocks     JSONB        DEFAULT '{}',   -- LLMInputBlocks
+    constraints      JSONB        DEFAULT '{}',   -- LLMConstraints
+    output_structure JSONB        DEFAULT '{}',   -- LLMOutputStructure
+    behavior         JSONB        DEFAULT '{}',   -- LLMBehaviorAnalysis
+    latency_ms       NUMERIC(10,2),
+    timestamp        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_obs_llm_ts ON observability_llm_traces (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_obs_llm_behavior ON observability_llm_traces
+    ((behavior->>'classification'), timestamp DESC);

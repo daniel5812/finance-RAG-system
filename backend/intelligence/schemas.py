@@ -71,10 +71,11 @@ class MarketContext(BaseModel):
     unemployment: Optional[float] = None    # UNRATE latest value
     gdp_latest: Optional[float] = None      # GDP latest value
     usd_ils_rate: Optional[float] = None    # latest USD/ILS
+    yield_curve: Optional[float] = None     # 10Y-2Y Treasury spread (DGS10 - DGS2)
+    vix: Optional[float] = None             # CBOE Volatility Index (VIXCLS)
     regime_confidence: str = "low"          # high / medium / low
     macro_signals: list[str] = Field(default_factory=list)
-    # e.g. ["Fed rate 5.25% — tight monetary policy",
-    #        "CPI 6.1% — above target, inflationary pressure"]
+    data_staleness_warning: Optional[str] = None  # set if macro data > 7 days old
 
 
 # ─────────────────────────────────────────────────────────────
@@ -84,14 +85,17 @@ class MarketContext(BaseModel):
 class AssetProfile(BaseModel):
     ticker: str
     asset_type: AssetType = AssetType.UNKNOWN
-    sector: Optional[str] = None
+    sector: Optional[str] = None                           # e.g. "Technology", "Financials"
     recent_price: Optional[float] = None
-    price_7d_change_pct: Optional[float] = None    # short-term momentum
-    price_30d_change_pct: Optional[float] = None   # medium-term trend
-    price_volatility_signal: str = "unknown"       # low / medium / high
+    price_7d_change_pct: Optional[float] = None            # short-term momentum
+    price_30d_change_pct: Optional[float] = None           # medium-term trend
+    price_volatility_signal: str = "unknown"               # low / medium / high (categorical)
+    annualized_vol: Optional[float] = None                 # actual annualized vol (e.g. 0.22 = 22%)
+    beta_vs_spy: Optional[float] = None                    # beta relative to SPY
+    momentum: Optional[str] = None                         # strong_up / up / flat / down / strong_down
     etf_top_holdings: list[str] = Field(default_factory=list)
-    data_freshness: str = "unknown"                # days since last price
-    source_confidence: str = "low"                 # high / medium / low
+    data_freshness: str = "unknown"                        # days since last price
+    source_confidence: str = "low"                         # high / medium / low
 
 
 # ─────────────────────────────────────────────────────────────
@@ -104,6 +108,7 @@ class AssetScore(BaseModel):
     user_fit_score: float = 0.5         # how well asset fits user profile
     diversification_score: float = 0.5  # how much it reduces concentration
     risk_alignment_score: float = 0.5   # asset risk vs user risk tolerance
+    momentum_score: float = 0.5         # trend alignment score
     composite_score: float = 0.5        # weighted aggregate
     score_factors: dict[str, str] = Field(default_factory=dict)
     # human-readable factor explanations, e.g.:
@@ -133,6 +138,32 @@ class NormalizedPortfolio(BaseModel):
         "Allocation % is based on cost_basis × quantity (invested capital). "
         "Current market value and P&L are NOT available without live prices."
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Agent: PortfolioGapAnalysis output
+# ─────────────────────────────────────────────────────────────
+
+class SectorWeight(BaseModel):
+    sector: str
+    portfolio_pct: float     # % of portfolio in this sector
+    benchmark_pct: float     # SPY reference weight
+    gap_pct: float           # portfolio - benchmark (negative = underweight)
+
+
+class PortfolioGapAnalysis(BaseModel):
+    """
+    Portfolio-level analysis run when no specific tickers are mentioned.
+    Compares sector distribution against a benchmark and identifies missing asset classes.
+    """
+    sector_weights: list[SectorWeight] = Field(default_factory=list)
+    missing_asset_classes: list[str] = Field(default_factory=list)    # e.g. ["Fixed Income", "International"]
+    overweight_sectors: list[str] = Field(default_factory=list)       # sectors > 10% above benchmark
+    underweight_sectors: list[str] = Field(default_factory=list)      # sectors > 10% below benchmark
+    concentration_score: float = 0.0                                   # HHI-based 0-1 (higher = more concentrated)
+    diversification_gaps: list[str] = Field(default_factory=list)     # human-readable gap descriptions
+    suggested_directions: list[str] = Field(default_factory=list)     # actionable diversification directions
+    data_coverage: str = "partial"                                     # full / partial / none
 
 
 # ─────────────────────────────────────────────────────────────
@@ -195,6 +226,7 @@ class IntelligenceReport(BaseModel):
     asset_profiles: list[AssetProfile] = Field(default_factory=list)
     portfolio_fit: Optional[PortfolioFitAnalysis] = None
     normalized_portfolio: Optional[NormalizedPortfolio] = None   # pre-computed financial metrics
+    portfolio_gap_analysis: Optional[PortfolioGapAnalysis] = None  # sector/class gap vs benchmark
     recommendations: list[AssetRecommendation] = Field(default_factory=list)
     asset_scores: list[AssetScore] = Field(default_factory=list)
     validation_result: Optional[ValidationResult] = None         # post-generation sanity check
@@ -203,6 +235,12 @@ class IntelligenceReport(BaseModel):
     agents_ran: list[str] = Field(default_factory=list)
     agents_skipped: list[str] = Field(default_factory=list)
     pipeline_confidence: str = "low"   # high / medium / low — set deterministically, never by LLM
+
+    # LLM mode — determines which response structure the LLM should use
+    # "explanation": factual, concise answer
+    # "synthesis": advisory portfolio-level analysis (no specific assets queried)
+    # "document_analysis": document extraction and analysis
+    llm_mode: str = "explanation"
 
     @property
     def has_recommendations(self) -> bool:

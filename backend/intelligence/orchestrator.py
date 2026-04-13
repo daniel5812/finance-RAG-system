@@ -13,14 +13,21 @@ Agent execution rules:
   - ALWAYS run when pool available: MarketAnalyzerAgent (reads global macro)
   - CONDITIONAL on tickers present: AssetProfilerAgent, ScoringEngineAgent,
     PortfolioFitAgent, RecommendationAgent
+  - ADVISORY queries WITHOUT tickers → run PortfolioGapAnalysisAgent instead
   - ADVISORY/ANALYTICAL queries: full pipeline
   - FACTUAL queries (e.g. "what is the fed rate?"): market only, skip scoring
+
+LLM mode selection:
+  - "document_analysis": document/filing analysis query
+  - "synthesis": advisory query without specific tickers (portfolio-level)
+  - "explanation": everything else (factual, with specific tickers)
 
 Pipeline parallelism:
   - MarketAnalyzerAgent + AssetProfilerAgent + PortfolioFitAgent run in parallel
     (they all read different DB tables and have no dependencies on each other)
   - ScoringEngineAgent runs after all three above complete (needs their outputs)
   - RecommendationAgent runs after ScoringEngineAgent
+  - PortfolioGapAnalysisAgent runs after PortfolioFitAgent (needs normalized portfolio)
 
 Failure isolation:
   - Each agent is wrapped in try/except
@@ -45,6 +52,7 @@ from core.logger import get_logger
 from intelligence.agents.asset_profiler import AssetProfilerAgent
 from intelligence.agents.market_analyzer import MarketAnalyzerAgent
 from intelligence.agents.portfolio_fit import PortfolioFitAgent
+from intelligence.agents.portfolio_gap_analysis import PortfolioGapAnalysisAgent
 from intelligence.agents.recommendation import RecommendationAgent
 from intelligence.agents.scoring_engine import ScoringEngineAgent
 from intelligence.agents.user_profiler import UserProfilerAgent
@@ -70,6 +78,13 @@ _ADVISORY_KEYWORDS = {
     "reduce", "increase", "allocate", "allocation", "exposure",
     # Hebrew
     "כדאי", "להשקיע", "המלצה", "לקנות", "למכור", "תיק", "חשיפה",
+}
+
+# Keywords that indicate document analysis mode
+_DOCUMENT_KEYWORDS = {
+    "report", "filing", "annual", "quarterly", "10-k", "10-q", "document",
+    "read", "analyze", "analysis of", "what does the", "according to",
+    "based on the document", "in the report", "from the document",
 }
 
 
@@ -99,13 +114,17 @@ class IntelligenceOrchestrator:
             report.user_profile = user_profile
             report.agents_ran.append("UserProfilerAgent")
 
+            # ── Determine LLM mode ────────────────────────────────────────
+            tickers = _extract_tickers(question)
+            llm_mode = _select_llm_mode(question, intent, tickers)
+            report.llm_mode = llm_mode
+
             if not pool:
                 report.agents_skipped.append("all_db_agents: no pool")
                 report.pipeline_confidence = "none"
                 return report
 
             # ── Decide pipeline depth ────────────────────────────────────
-            tickers = _extract_tickers(question)
             run_full = _needs_full_pipeline(question, intent, tickers)
 
             # ── Stage 1: Parallel DB reads ───────────────────────────────
@@ -152,6 +171,28 @@ class IntelligenceOrchestrator:
                 # Surface the normalized portfolio at the top-level report
                 if portfolio_fit.normalized_portfolio:
                     report.normalized_portfolio = portfolio_fit.normalized_portfolio
+
+            # ── Portfolio Gap Analysis (synthesis mode / no tickers) ─────
+            # Runs when advisory/analytical intent but no specific tickers — provides
+            # portfolio-level structural analysis as the primary intelligence output.
+            if run_full and not tickers and report.normalized_portfolio:
+                try:
+                    port_tickers_list = (
+                        report.portfolio_fit.tickers_in_portfolio
+                        if report.portfolio_fit else []
+                    )
+                    gap_analysis = PortfolioGapAnalysisAgent.run(
+                        normalized_portfolio=report.normalized_portfolio,
+                        portfolio_tickers=port_tickers_list,
+                    )
+                    report.portfolio_gap_analysis = gap_analysis
+                    report.agents_ran.append("PortfolioGapAnalysisAgent")
+                except Exception as exc:
+                    logger.warning(
+                        f'{{"event": "orchestrator", "agent": "PortfolioGapAnalysisAgent", '
+                        f'"status": "failed", "error": "{exc}"}}'
+                    )
+                    report.agents_skipped.append(f"PortfolioGapAnalysisAgent: {exc}")
 
             # ── Stage 2: Scoring (depends on stage 1) ───────────────────
             if run_full and asset_profiles:
@@ -223,6 +264,7 @@ class IntelligenceOrchestrator:
                 f'{{"event": "intelligence_orchestrator", "status": "ok", '
                 f'"ran": {report.agents_ran}, '
                 f'"tickers": {tickers}, '
+                f'"llm_mode": "{report.llm_mode}", '
                 f'"confidence": "{report.pipeline_confidence}"}}'
             )
 
@@ -247,10 +289,42 @@ def _extract_tickers(text: str) -> list[str]:
     return [t for t in dict.fromkeys(candidates) if t not in _TICKER_BLACKLIST][:5]
 
 
+def _select_llm_mode(question: str, intent: str, tickers: list[str]) -> str:
+    """
+    Determine how the LLM should frame its response.
+
+    - "document_analysis": user asking to analyze a specific document/filing
+    - "synthesis": advisory query at portfolio level, no specific tickers
+    - "explanation": specific asset query, factual, or default
+    """
+    q_lower = question.lower()
+
+    # 1. Document focused -> document_analysis
+    if any(kw in q_lower for kw in _DOCUMENT_KEYWORDS):
+        return "document_analysis"
+
+    # 2. General strategy / no specific assets -> advisory
+    is_general_advisory = not tickers and (
+        intent == "advisory" or any(kw in q_lower for kw in _ADVISORY_KEYWORDS)
+    )
+    if is_general_advisory:
+        return "advisory"
+
+    # 3. Specific assets mentioned
+    if tickers:
+        # Check if the user is asking about the portfolio's relationship to the assets
+        is_portfolio_query = any(kw in q_lower for kw in ("portfolio", "my positions", "allocation", "holdings"))
+        return "synthesis" if is_portfolio_query else "explanation"
+
+    # 4. Fallback to explanation for basic factual queries
+    return "explanation"
+
+
 def _needs_full_pipeline(question: str, intent: str, tickers: list[str]) -> bool:
     """
     Return True if scoring and recommendation agents should run.
     Advisory queries always do. Factual queries without tickers skip it.
+    Portfolio-level advisory (no tickers) also runs for portfolio gap analysis.
     """
     if intent == "advisory":
         return True
@@ -265,6 +339,16 @@ def _needs_full_pipeline(question: str, intent: str, tickers: list[str]) -> bool
 def _compute_pipeline_confidence(report: IntelligenceReport) -> str:
     """Compute overall pipeline confidence from agent data quality."""
     mc = report.market_context
+
+    # Synthesis/Advisory mode: confidence based on portfolio gap analysis + market
+    if report.llm_mode in ("synthesis", "advisory"):
+        if report.portfolio_gap_analysis and report.portfolio_gap_analysis.data_coverage == "full":
+            return "high" if mc and mc.regime_confidence in ("high", "medium") else "medium"
+        if report.normalized_portfolio and mc:
+            return "medium"
+        return "low"
+
+    # Explanation/asset mode: confidence from scores and market data
     if mc and mc.regime_confidence == "high" and len(report.asset_scores) > 0:
         all_full = all(s.data_coverage == "full" for s in report.asset_scores)
         return "high" if all_full else "medium"

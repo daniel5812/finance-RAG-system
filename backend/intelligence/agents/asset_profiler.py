@@ -15,7 +15,10 @@ Outputs:
 Design:
   - All DB queries are parameterized, no LLM calls.
   - Asset type is inferred from ETF holdings presence and known ETF list.
-  - Volatility signal derived from 30-day price range (deterministic).
+  - Volatility: annualized standard deviation of log returns × sqrt(252).
+  - Beta vs SPY: computed from overlapping price history with SPY.
+  - Momentum: derived from 7d and 30d price changes.
+  - Sector: mapped from static dictionary; ETF-aware.
   - Source confidence degrades if price data is stale or missing.
   - ETF holdings fetched for known ETF symbols only (top 5 by weight).
   - Graceful degradation: if ticker has no data → minimal profile with low confidence.
@@ -23,9 +26,10 @@ Design:
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
-from math import sqrt
 
+import numpy as np
 import asyncpg
 
 from core.logger import get_logger
@@ -39,6 +43,66 @@ _KNOWN_ETFS = {
     "AGG", "BND", "GLD", "TLT", "IWM", "XLF", "XLE",
     "XLK", "XLV", "XLU", "XLB", "XLC", "XLI", "XLRE",
     "VNQ", "HYG", "LQD", "EMB", "IEFA", "EEM", "DIA",
+}
+
+# Static sector mapping for common tickers and sector ETFs
+_SECTOR_MAP: dict[str, str] = {
+    # Technology
+    "AAPL": "Technology", "MSFT": "Technology", "GOOGL": "Technology",
+    "GOOG": "Technology", "META": "Technology", "NVDA": "Technology",
+    "AMD": "Technology", "INTC": "Technology", "CRM": "Technology",
+    "ORCL": "Technology", "CSCO": "Technology", "ADBE": "Technology",
+    "QCOM": "Technology", "TXN": "Technology", "AVGO": "Technology",
+    # Consumer Discretionary
+    "AMZN": "Consumer Discretionary", "TSLA": "Consumer Discretionary",
+    "NKE": "Consumer Discretionary", "HD": "Consumer Discretionary",
+    "MCD": "Consumer Discretionary", "SBUX": "Consumer Discretionary",
+    # Financials
+    "JPM": "Financials", "GS": "Financials", "BAC": "Financials",
+    "WFC": "Financials", "V": "Financials", "MA": "Financials",
+    "MS": "Financials", "C": "Financials", "BLK": "Financials",
+    # Healthcare
+    "JNJ": "Healthcare", "PFE": "Healthcare", "MRK": "Healthcare",
+    "ABBV": "Healthcare", "LLY": "Healthcare", "UNH": "Healthcare",
+    "BMY": "Healthcare", "AMGN": "Healthcare", "GILD": "Healthcare",
+    # Energy
+    "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
+    "SLB": "Energy", "EOG": "Energy",
+    # Consumer Staples
+    "PG": "Consumer Staples", "KO": "Consumer Staples", "PEP": "Consumer Staples",
+    "WMT": "Consumer Staples", "COST": "Consumer Staples", "PM": "Consumer Staples",
+    # Communication Services
+    "NFLX": "Communication Services", "DIS": "Communication Services",
+    "T": "Communication Services", "VZ": "Communication Services",
+    # Industrials
+    "BA": "Industrials", "CAT": "Industrials", "GE": "Industrials",
+    "RTX": "Industrials", "HON": "Industrials", "UPS": "Industrials",
+    # Materials
+    "LIN": "Materials", "APD": "Materials", "NEM": "Materials",
+    # Utilities
+    "NEE": "Utilities", "DUK": "Utilities", "SO": "Utilities",
+    # Real Estate
+    "AMT": "Real Estate", "PLD": "Real Estate", "CCI": "Real Estate",
+    # Commodities
+    "GLD": "Commodities", "SLV": "Commodities", "USO": "Commodities",
+    # Sector ETFs
+    "XLK": "Technology", "XLF": "Financials", "XLE": "Energy",
+    "XLV": "Healthcare", "XLU": "Utilities", "XLB": "Materials",
+    "XLC": "Communication Services", "XLI": "Industrials", "XLRE": "Real Estate",
+    # Broad market ETFs
+    "SPY": "US Broad Market", "IVV": "US Broad Market", "VOO": "US Broad Market",
+    "VTI": "US Total Market", "QQQ": "Technology Heavy",
+    "IWM": "US Small Cap", "DIA": "US Large Cap",
+    # International ETFs
+    "VEA": "International Developed", "IEFA": "International Developed",
+    "VWO": "Emerging Markets", "EEM": "Emerging Markets",
+    # Real estate ETFs
+    "VNQ": "Real Estate",
+    # Fixed income ETFs
+    "AGG": "US Bond Market", "BND": "US Bond Market",
+    "TLT": "Long-Term Bonds", "SHY": "Short-Term Bonds", "IEF": "Intermediate Bonds",
+    "HYG": "High Yield Bonds", "LQD": "Investment Grade Bonds",
+    "EMB": "Emerging Market Bonds",
 }
 
 
@@ -59,10 +123,18 @@ class AssetProfilerAgent:
         if not tickers or not pool:
             return []
 
+        # Pre-fetch SPY prices once for beta calculation (shared across all tickers)
+        spy_prices: list[dict] = []
+        if "SPY" not in tickers:
+            try:
+                spy_prices = await _fetch_prices("SPY", pool, days=35)
+            except Exception:
+                spy_prices = []
+
         profiles: list[AssetProfile] = []
         for ticker in tickers[:5]:  # cap at 5 to bound latency
             try:
-                profile = await _build_profile(ticker, pool)
+                profile = await _build_profile(ticker, pool, spy_prices)
                 profiles.append(profile)
             except Exception as exc:
                 logger.warning(
@@ -82,7 +154,11 @@ class AssetProfilerAgent:
 # Per-ticker builder
 # ─────────────────────────────────────────────────────────────
 
-async def _build_profile(ticker: str, pool: asyncpg.Pool) -> AssetProfile:
+async def _build_profile(
+    ticker: str,
+    pool: asyncpg.Pool,
+    spy_prices: list[dict],
+) -> AssetProfile:
     prices = await _fetch_prices(ticker, pool, days=35)
 
     # ── Asset type ───────────────────────────────────────────
@@ -93,11 +169,17 @@ async def _build_profile(ticker: str, pool: asyncpg.Pool) -> AssetProfile:
     else:
         asset_type = AssetType.STOCK  # default assumption
 
+    # ── Sector ───────────────────────────────────────────────
+    sector = _SECTOR_MAP.get(ticker.upper())
+
     # ── Price stats ──────────────────────────────────────────
     recent_price: float | None = None
     p7d_chg: float | None = None
     p30d_chg: float | None = None
     vol_signal = "unknown"
+    annualized_vol: float | None = None
+    beta_vs_spy: float | None = None
+    momentum: str | None = None
     freshness = "unknown"
 
     if prices:
@@ -119,19 +201,50 @@ async def _build_profile(ticker: str, pool: asyncpg.Pool) -> AssetProfile:
             if price_30d and price_30d > 0:
                 p30d_chg = round((recent_price - price_30d) / price_30d * 100, 2)
 
-        # Volatility: daily range / close as proxy
-        if len(prices) >= 5:
-            ranges = []
-            for p in prices[:20]:
-                if p.get("high") and p.get("low") and p["close"]:
-                    ranges.append((p["high"] - p["low"]) / p["close"])
-            if ranges:
-                avg_range = sum(ranges) / len(ranges)
+        # ── Volatility: annualized std of log returns ─────────
+        # prices are DESC by date → sort ASC for sequential return computation
+        sorted_prices = sorted(prices, key=lambda p: p["date"])
+        closes = [p["close"] for p in sorted_prices if p.get("close") and p["close"] > 0]
+
+        if len(closes) >= 5:
+            log_returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+            if log_returns:
+                daily_std = float(np.std(log_returns, ddof=1))
+                annualized_vol = round(daily_std * math.sqrt(252), 4)  # e.g. 0.22 = 22% vol
                 vol_signal = (
-                    "high"   if avg_range > 0.025 else
-                    "medium" if avg_range > 0.012 else
+                    "high"   if annualized_vol > 0.30 else
+                    "medium" if annualized_vol > 0.15 else
                     "low"
                 )
+
+        # ── Momentum: trend from 7d and 30d changes ──────────
+        if p7d_chg is not None and p30d_chg is not None:
+            if p7d_chg > 5 and p30d_chg > 10:
+                momentum = "strong_up"
+            elif p7d_chg > 2 or p30d_chg > 5:
+                momentum = "up"
+            elif p7d_chg < -5 and p30d_chg < -10:
+                momentum = "strong_down"
+            elif p7d_chg < -2 or p30d_chg < -5:
+                momentum = "down"
+            else:
+                momentum = "flat"
+        elif p30d_chg is not None:
+            if p30d_chg > 10:
+                momentum = "strong_up"
+            elif p30d_chg > 5:
+                momentum = "up"
+            elif p30d_chg < -10:
+                momentum = "strong_down"
+            elif p30d_chg < -5:
+                momentum = "down"
+            else:
+                momentum = "flat"
+
+        # ── Beta vs SPY ───────────────────────────────────────
+        ref_prices = spy_prices if ticker != "SPY" else []
+        if ref_prices and len(closes) >= 10:
+            beta_vs_spy = _compute_beta(prices, ref_prices)
 
     # ── Source confidence ────────────────────────────────────
     if not prices:
@@ -151,14 +264,61 @@ async def _build_profile(ticker: str, pool: asyncpg.Pool) -> AssetProfile:
     return AssetProfile(
         ticker=ticker,
         asset_type=asset_type,
+        sector=sector,
         recent_price=recent_price,
         price_7d_change_pct=p7d_chg,
         price_30d_change_pct=p30d_chg,
         price_volatility_signal=vol_signal,
+        annualized_vol=annualized_vol,
+        beta_vs_spy=beta_vs_spy,
+        momentum=momentum,
         etf_top_holdings=etf_top,
         data_freshness=freshness,
         source_confidence=source_confidence,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Beta calculation
+# ─────────────────────────────────────────────────────────────
+
+def _compute_beta(ticker_prices: list[dict], spy_prices: list[dict]) -> float | None:
+    """
+    Compute beta of ticker vs SPY using overlapping daily log returns.
+    Both price lists are sorted DESC by date.
+    Returns None if insufficient overlapping data.
+    """
+    try:
+        ticker_map = {
+            p["date"]: p["close"]
+            for p in ticker_prices
+            if p.get("close") and p["close"] > 0
+        }
+        spy_map = {
+            p["date"]: p["close"]
+            for p in spy_prices
+            if p.get("close") and p["close"] > 0
+        }
+
+        common_dates = sorted(ticker_map.keys() & spy_map.keys())
+        if len(common_dates) < 10:
+            return None
+
+        ticker_closes = [ticker_map[d] for d in common_dates]
+        spy_closes = [spy_map[d] for d in common_dates]
+
+        ticker_returns = np.diff(np.log(ticker_closes))
+        spy_returns = np.diff(np.log(spy_closes))
+
+        spy_var = float(np.var(spy_returns, ddof=1))
+        if spy_var == 0:
+            return None
+
+        cov = float(np.cov(ticker_returns, spy_returns)[0, 1])
+        beta = cov / spy_var
+        return round(beta, 2)
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────

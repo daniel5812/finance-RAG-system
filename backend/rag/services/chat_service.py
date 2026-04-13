@@ -32,6 +32,15 @@ from financial.services.user_profile_service import UserProfileService
 from intelligence.orchestrator import IntelligenceOrchestrator
 from intelligence.context_builder import build_intelligence_context
 
+from observability.service import obs
+from observability.schemas import (
+    PipelineStage, EventStatus, EventSeverity, ErrorCategory,
+    LLMTrace, LLMConstraints, RequestRun,
+)
+from observability.analyzer import (
+    analyze_llm_behavior, build_llm_input_blocks, build_llm_output_structure,
+)
+
 logger = get_logger(__name__)
 
 # ── Conversation Memory Settings ──
@@ -352,6 +361,28 @@ async def regenerate_response(pinecone_index: Any, question: str, cache_key: str
 
     except Exception as e:
         logger.error(f"Background regeneration failed: {e}")
+
+# ── SQL Result Formatter: Convert rows to text to reduce arithmetic exposure ──
+def _format_sql_rows_as_text(rows: list[dict], max_rows: int = 3) -> str:
+    """
+    Format SQL result rows as simple text lines instead of JSON.
+    Avoids structured numeric data to reduce LLM arithmetic temptation.
+    Schema-agnostic: works for any table type.
+    """
+    if not rows:
+        return "No data returned."
+
+    lines = []
+    for i, row in enumerate(rows[:max_rows], 1):
+        # Convert each row dict to simple key=value pairs
+        pairs = [f"{k}={v}" for k, v in row.items()]
+        lines.append(f"Row {i}: {', '.join(pairs)}")
+
+    if len(rows) > max_rows:
+        lines.append(f"(... {len(rows) - max_rows} more rows)")
+
+    return "\n".join(lines)
+
 async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, plan, query: ChatQuery, loop, user_role: str):
     sql_time = 0.0
     embed_time = 0.0
@@ -382,7 +413,7 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
             elif "macro_series" in q_lower: table_label = "Macro Indicators"
             elif "prices" in q_lower: table_label = "Market Prices"
 
-            sql_text = f"{table_label} Result: {json.dumps(result[:10], default=str)}"
+            sql_text = f"{table_label} Result:\n{_format_sql_rows_as_text(result)}"
             tag = f"[S{len(contexts) + 1}]"
             contexts.append(f"Source {tag}: {sql_text}")
             
@@ -532,6 +563,9 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
         # 🟡 SOFT EXPIRED → Return stale + background refresh
         if age > CACHE_SOFT_TTL:
             logger.info(json.dumps({"event": "cache_stale", "action": "return_stale_and_refresh"}))
+            obs.emit(PipelineStage.CACHE, "cache_stale",
+                     summary="Exact cache stale — returning stale response + background refresh",
+                     data={"age_s": round(age, 1)})
             asyncio.create_task(
                 regenerate_response(pinecone_index, query.question, cache_key, query.user_role)
             )
@@ -545,6 +579,9 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
         # 🟢 VALID
         else:
             logger.info(json.dumps({"event": "cache_hit"}))
+            obs.emit(PipelineStage.CACHE, "cache_hit",
+                     summary="Exact cache hit — skipping pipeline",
+                     data={"age_s": round(age, 1)})
             await state.incr_metric(state.METRIC_HIT)
             cached = cache_entry["data"]
             cached["source_type"] = "cache"
@@ -554,6 +591,9 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             return cached
 
     await state.incr_metric(state.METRIC_MISS)
+    obs.emit(PipelineStage.CACHE, "cache_miss",
+             summary="No exact cache hit — proceeding to full pipeline",
+             status=EventStatus.WARNING)
 
     # 🔹 0. CONDENSE QUESTION (only on cache miss)
     # Load stored summary early so condense_question can resolve references from older turns
@@ -571,6 +611,9 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id)
     if sem_result is not None:
         logger.info(json.dumps({"event": "semantic_cache_hit"}))
+        obs.emit(PipelineStage.CACHE, "semantic_cache_hit",
+                 summary="Semantic cache hit — semantically similar cached response returned",
+                 data={"cache_type": "semantic"})
         await state.incr_metric(state.METRIC_HIT)
         sem_result["source_type"] = "semantic_cache"
         if query.session_id:
@@ -582,7 +625,14 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     t_plan = time.time()
     multi_plan = await QueryOrchestrator.get_plan(query.question, query_vector, query.user_role)
     plan_time = time.time() - t_plan
-    
+    obs.emit(
+        PipelineStage.ROUTER, "router_plan_built",
+        summary=f"{len(multi_plan.plans)} plan(s): {', '.join(p.source + '(' + (p.intent or '') + ')' for p in multi_plan.plans)}",
+        latency_ms=plan_time * 1000,
+        data={"plan_count": len(multi_plan.plans),
+              "plans": [{"source": p.source, "intent": getattr(p, "intent", None)} for p in multi_plan.plans]},
+    )
+
     # 🔹 3. CONCURRENT RETRIEVAL (Stage 9)
     t_ret_start = time.time()
     tasks = [
@@ -591,8 +641,20 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     ]
     sub_results = await asyncio.gather(*tasks)
     retrieval_time = time.time() - t_ret_start
-    
+
     relevant_contexts, sources, metrics, citations = merge_contexts(sub_results)
+    obs.emit(
+        PipelineStage.VECTOR_RETRIEVAL, "retrieval_complete",
+        summary=f"Retrieved {len(relevant_contexts)} context chunk(s) from {len(multi_plan.plans)} plan(s)",
+        latency_ms=retrieval_time * 1000,
+        data={
+            "context_count": len(relevant_contexts),
+            "source_count":  len(sources),
+            "sql_ms":        round(metrics.get("sql", 0) * 1000, 1),
+            "embed_ms":      round(metrics.get("embed", 0) * 1000, 1),
+            "rerank_ms":     round(metrics.get("rerank", 0) * 1000, 1),
+        },
+    )
 
     # 🔹 5. Generation
     context_block = "\n---\n".join(relevant_contexts) if relevant_contexts else ""
@@ -617,6 +679,9 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     # Runs between retrieval and LLM synthesis. Failure is isolated — never crashes the pipeline.
     intelligence_block = ""
     pipeline_confidence: str | None = None   # deterministic — overrides LLM self-reported confidence
+    _intelligence_report = None
+    _system_action: str | None = None
+    t_intel = time.time()
     try:
         intelligence_report = await IntelligenceOrchestrator.run(
             question=standalone_question,
@@ -625,8 +690,17 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             owner_id=query.owner_id,
             pool=pool,
         )
-        intelligence_block = build_intelligence_context(intelligence_report)
+        _intelligence_report = intelligence_report
         pipeline_confidence = intelligence_report.pipeline_confidence
+        intelligence_block = build_intelligence_context(intelligence_report)
+        _val_flags = (
+            intelligence_report.validation_result.flags
+            if intelligence_report.validation_result else []
+        )
+        _system_action = (
+            intelligence_report.recommendation.action
+            if getattr(intelligence_report, "recommendation", None) else None
+        )
         logger.info(json.dumps({
             "event": "intelligence_layer_complete",
             "agents_ran": intelligence_report.agents_ran,
@@ -637,8 +711,30 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
                 if intelligence_report.validation_result else None
             ),
         }))
+        obs.emit(
+            PipelineStage.VALIDATION, "intelligence_layer_complete",
+            summary=f"Intelligence pipeline done — confidence={pipeline_confidence}, action={_system_action}",
+            latency_ms=(time.time() - t_intel) * 1000,
+            data={
+                "agents_ran":          intelligence_report.agents_ran,
+                "confidence":          pipeline_confidence,
+                "system_action":       _system_action,
+                "has_recommendations": intelligence_report.has_recommendations,
+                "validation_passed":   (intelligence_report.validation_result.passed
+                                        if intelligence_report.validation_result else None),
+                "validation_flags":    _val_flags,
+            },
+        )
     except Exception as intel_err:
         logger.warning(json.dumps({"event": "intelligence_layer_failed", "error": str(intel_err)}))
+        obs.emit_error(
+            stage=PipelineStage.USER_PROFILER,
+            error_category=ErrorCategory.PIPELINE,
+            error_code="INTELLIGENCE_LAYER_FAILED",
+            message=str(intel_err),
+            exc=intel_err,
+        )
+        _val_flags = []
 
     user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
                                       intelligence_block=intelligence_block)
@@ -713,15 +809,43 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     if query.session_id:
         asyncio.create_task(save_message_to_db(pool, query.session_id, "user", query.question))
 
+    # 🔹 LLM PROMPT BUILD — record what we're about to send
+    _llm_input_blocks = build_llm_input_blocks(intelligence_block, context_block, portfolio_ctx)
+    obs.emit(
+        PipelineStage.LLM_PROMPT_BUILD, "prompt_assembled",
+        summary=(
+            f"Prompt assembled — ~{_llm_input_blocks.estimated_prompt_tokens} tokens, "
+            f"blocks: portfolio={_llm_input_blocks.has_normalized_portfolio}, "
+            f"market={_llm_input_blocks.has_market_context}, "
+            f"validation={_llm_input_blocks.has_validation_block}, "
+            f"vector={_llm_input_blocks.has_vector_context}"
+        ),
+        data=_llm_input_blocks.model_dump(),
+    )
+
     try:
         await asyncio.wait_for(LLM_SEMAPHORE.acquire(), timeout=LLM_WAIT_TIMEOUT)
     except asyncio.TimeoutError:
+        obs.emit_error(
+            stage=PipelineStage.LLM_EXECUTION,
+            error_category=ErrorCategory.INFRA,
+            error_code="LLM_SEMAPHORE_TIMEOUT",
+            message=f"LLM semaphore wait exceeded {LLM_WAIT_TIMEOUT}s — server overloaded",
+        )
         raise HTTPException(503, "Server busy — too many concurrent LLM requests. Try again in a few seconds.")
 
+    t_llm = time.time()
     try:
         answer = await ChatAgentClient.generate(messages=messages)
     finally:
         LLM_SEMAPHORE.release()
+    _llm_latency_ms = (time.time() - t_llm) * 1000
+    obs.emit(
+        PipelineStage.LLM_EXECUTION, "llm_call_done",
+        summary=f"LLM responded in {round(_llm_latency_ms)}ms — {len(answer)} chars",
+        latency_ms=_llm_latency_ms,
+        data={"response_chars": len(answer)},
+    )
 
     suggested_questions = []
     reasoning_summary = None
@@ -764,6 +888,55 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     gen_time = time.time() - t_gen
     total_time = time.time() - t0
+
+    # 🔹 LLM INTROSPECTION — build and emit the full LLM trace
+    try:
+        _llm_output = build_llm_output_structure(
+            answer=answer,
+            suggested_questions=suggested_questions,
+            pipeline_confidence=pipeline_confidence,
+            reasoning_summary=reasoning_summary,
+            system_action=_system_action,
+        )
+        _llm_behavior = analyze_llm_behavior(
+            response=answer,
+            pipeline_confidence=pipeline_confidence,
+            system_action=_system_action,
+            validation_flags=_val_flags,
+            input_blocks=_llm_input_blocks,
+        )
+        _llm_trace = LLMTrace(
+            req_id=obs._req_id(),
+            input_blocks=_llm_input_blocks,
+            constraints=LLMConstraints(
+                forbidden_operations_applied=True,
+                no_arithmetic_mode=True,
+                cite_only_directive=True,
+                intelligence_block_injected=bool(intelligence_block),
+            ),
+            output_structure=_llm_output,
+            behavior=_llm_behavior,
+            latency_ms=_llm_latency_ms,
+        )
+        obs.emit_llm_trace(_llm_trace)
+        obs.emit(
+            PipelineStage.RESPONSE, "response_finalized",
+            summary=(
+                f"Response ready — behavior={_llm_behavior.classification}, "
+                f"confidence={pipeline_confidence}, flags={[f.value for f in _llm_behavior.flags]}"
+            ),
+            latency_ms=total_time * 1000,
+            data={
+                "behavior":   _llm_behavior.classification,
+                "flags":      [f.value for f in _llm_behavior.flags],
+                "confidence": pipeline_confidence,
+                "total_ms":   round(total_time * 1000, 1),
+                "sources":    len(sources),
+            },
+            severity=EventSeverity.WARNING if _llm_behavior.classification != "followed_system" else EventSeverity.INFO,
+        )
+    except Exception as _trace_err:
+        logger.warning(f"LLM trace build failed (non-fatal): {_trace_err}")
 
     result = {
         "answer": answer,
@@ -993,8 +1166,8 @@ async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embe
             owner_id=query.owner_id,
             pool=pool,
         )
-        stream_intelligence_block = build_intelligence_context(stream_intelligence_report)
         stream_pipeline_confidence = stream_intelligence_report.pipeline_confidence
+        stream_intelligence_block = build_intelligence_context(stream_intelligence_report)
         logger.info(json.dumps({
             "event": "intelligence_layer_complete_stream",
             "agents_ran": stream_intelligence_report.agents_ran,
@@ -1002,6 +1175,19 @@ async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embe
         }))
     except Exception as intel_err:
         logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
+
+    # 🔹 Build metadata for LLM tracing
+    _llm_input_blocks = build_llm_input_blocks(
+        has_normalized_portfolio=has_portfolio,
+        has_market_context=True,  # Macro is usually injected by IntelligenceOrchestrator
+        has_validation_block=True,
+        has_vector_context=has_context,
+        has_sql_context=any(p.get('tool') == 'sql' for p in multi_plan.plans),
+        intelligence_block=stream_intelligence_report,
+        context_block=context_block
+    )
+    _system_action = "EXPLANATION" if not has_portfolio else "SYNTHESIS" # Baseline
+    if intent == "advisory": _system_action = "ADVISORY"
 
     user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
                                       intelligence_block=stream_intelligence_block)
@@ -1178,6 +1364,42 @@ async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embe
         # Final meta packet with explainability, suggested questions and FULL latency breakdown
         yield f"data: {json.dumps({'type': 'meta', 'reasoning_summary': reasoning_summary, 'confidence_level': confidence_level, 'suggested_questions': suggested_questions, 'latency': result['latency_breakdown']})}\n\n"
         yield f"data: {json.dumps({'type': 'done', 'total_time': round(total_time, 3), 'generation_time': round(gen_time, 3), 'answer_length': len(full_answer)})}\n\n"
+
+        # 🔹 LLM INTROSPECTION — build and emit the full LLM trace (STREAM PATH)
+        try:
+            _llm_output = build_llm_output_structure(
+                answer=full_answer,
+                suggested_questions=suggested_questions,
+                pipeline_confidence=stream_pipeline_confidence,
+                reasoning_summary=reasoning_summary,
+                system_action=_system_action,
+            )
+            # Fetch validation flags if any (simulated for now or extract from previous steps)
+            _val_flags = [] # Optional: connect to ValidationAgent if used in stream
+
+            _llm_behavior = analyze_llm_behavior(
+                response=full_answer,
+                pipeline_confidence=stream_pipeline_confidence,
+                system_action=_system_action,
+                validation_flags=_val_flags,
+                input_blocks=_llm_input_blocks,
+            )
+            _llm_trace = LLMTrace(
+                req_id=obs._req_id(),
+                input_blocks=_llm_input_blocks,
+                constraints=LLMConstraints(
+                    forbidden_operations_applied=True,
+                    no_arithmetic_mode=True,
+                    cite_only_directive=True,
+                    intelligence_block_injected=bool(stream_intelligence_block),
+                ),
+                output_structure=_llm_output,
+                behavior=_llm_behavior,
+                latency_ms=gen_time * 1000,
+            )
+            obs.emit_llm_trace(_llm_trace)
+        except Exception as introspection_err:
+            logger.warning(f"LLM Introspection failed in stream: {introspection_err}")
 
         # 🔹 Audit Log (Metadata only)
         asyncio.create_task(log_audit_event(

@@ -11,12 +11,15 @@ from core.routes.user import router as user_router
 from core.routes.auth import router as auth_router
 from core.routes.admin import router as admin_router
 from core.routes.portfolio import router as portfolio_router
+from observability.routes import router as observability_router
 
-from core.logger import get_logger
+from core.logger import get_logger, setup_logging
 from core.middleware import add_request_id
 from fastapi.middleware.cors import CORSMiddleware
 import core.db as db
 
+# ── Unified Logging — MUST run before app initialization ──
+setup_logging()
 logger = get_logger(__name__)
 
 
@@ -69,7 +72,8 @@ app.include_router(doc_router)              # POST /documents/upload
 app.include_router(user_router)             # GET/POST /user/settings
 app.include_router(auth_router)             # POST /auth/login/google
 app.include_router(admin_router)            # /admin/*
-app.include_router(portfolio_router)            # /portfolio/*
+app.include_router(portfolio_router)        # /portfolio/*
+app.include_router(observability_router)    # /admin/observability/*
 
 
 

@@ -1,17 +1,21 @@
 import { useEffect } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import Index from "./pages/Index.tsx";
-import NotFound from "./pages/NotFound.tsx";
-import Admin from "./pages/Admin";
 import Portfolio from "./pages/Portfolio.tsx";
 import Insights from "./pages/Insights.tsx";
+import { AdminLayout } from "./admin/components/AdminLayout";
+import { OverviewPage } from "./admin/pages/OverviewPage";
+import { RequestsPage } from "./admin/pages/RequestsPage";
+import { RequestDetailPage } from "./admin/pages/RequestDetailPage";
+import { ErrorsPage } from "./admin/pages/ErrorsPage";
+import { MetricsPage } from "./admin/pages/MetricsPage";
+import { UsersPage } from "./admin/pages/UsersPage";
 
 import { GoogleOAuthProvider } from "@react-oauth/google";
-import { Navigate } from "react-router-dom";
 import { isAuthenticated, getUser } from "@/lib/auth";
 import Login from "./pages/Login.tsx";
 import { InsightsProvider, useInsights } from "@/lib/insights";
@@ -67,15 +71,23 @@ const App = () => {
                   }
                 />
                 {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
-                {/* Admin Route */}
+                {/* Admin Platform */}
                 <Route
                   path="/admin"
                   element={
                     <ProtectedRoute requireAdmin>
-                      <Admin />
+                      <AdminLayout />
                     </ProtectedRoute>
                   }
-                />
+                >
+                  <Route index element={<Navigate to="/admin/overview" replace />} />
+                  <Route path="overview" element={<OverviewPage />} />
+                  <Route path="requests" element={<RequestsPage />} />
+                  <Route path="request/:req_id" element={<RequestDetailPage />} />
+                  <Route path="errors" element={<ErrorsPage />} />
+                  <Route path="metrics" element={<MetricsPage />} />
+                  <Route path="users" element={<UsersPage />} />
+                </Route>
 
                 {/* Portfolio Route */}
                 <Route

@@ -8,6 +8,9 @@ Responsibility:
     2. Recommendation actions that contradict the deterministic score thresholds
     3. Confidence levels inconsistent with data availability
     4. Recommendation confidence that exceeds data coverage
+    5. Advisory queries with no asset data (empty pipeline)
+    6. All assets having no source data
+    7. Missing recommendations when advisory intent was detected
 
 Design:
   - FULLY DETERMINISTIC — zero LLM calls
@@ -79,6 +82,7 @@ def _validate(report: IntelligenceReport) -> ValidationResult:
             ("user_fit_score",        score.user_fit_score),
             ("diversification_score", score.diversification_score),
             ("risk_alignment_score",  score.risk_alignment_score),
+            ("momentum_score",        score.momentum_score),
             ("composite_score",       score.composite_score),
         ]:
             if not (0.0 <= value <= 1.0):
@@ -158,6 +162,42 @@ def _validate(report: IntelligenceReport) -> ValidationResult:
                     f"ALLOCATION_SUM: normalized_portfolio allocations sum to "
                     f"{total_alloc:.1f}% (expected ~100%)"
                 )
+
+    # ── 6. Advisory query with no asset data ──────────────────────────────────
+    # If the pipeline ran full but produced no asset profiles OR scores,
+    # the LLM will not have real data to ground recommendations.
+    if (
+        report.llm_mode in ("synthesis",)
+        and not report.asset_profiles
+        and not report.portfolio_gap_analysis
+    ):
+        flags.append(
+            "EMPTY_ADVISORY_PIPELINE: advisory query but no asset profiles and no "
+            "portfolio gap analysis were produced — LLM context will be limited"
+        )
+
+    # ── 7. All assets have no source data ─────────────────────────────────────
+    if report.asset_profiles:
+        no_data_count = sum(
+            1 for ap in report.asset_profiles
+            if ap.source_confidence in ("none", "low")
+        )
+        if no_data_count == len(report.asset_profiles):
+            flags.append(
+                f"WEAK_DATA_COVERAGE: all {no_data_count} asset profile(s) have "
+                f"low/none source confidence — price data may be missing from DB"
+            )
+
+    # ── 8. Missing recommendations for advisory mode with scored assets ────────
+    if (
+        report.asset_scores
+        and not report.recommendations
+        and "RecommendationAgent" not in report.agents_ran
+    ):
+        flags.append(
+            "MISSING_RECOMMENDATIONS: asset scores computed but no recommendations "
+            "were generated — RecommendationAgent may have failed"
+        )
 
     # ── Compute confidence override ────────────────────────────────────────────
     confidence_override: str | None = None

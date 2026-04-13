@@ -12,27 +12,53 @@ user_id_var: ContextVar[str] = ContextVar("user_id", default="none")
 class StructuredFormatter(logging.Formatter):
     """Outputs logs as single-line JSON for machine parsing."""
     def format(self, record):
+        message = record.getMessage()
+        
+        # Try to parse message as JSON if it looks like it, to avoid double-encoding
+        event_data = message
+        if isinstance(message, str) and message.startswith("{") and message.endswith("}"):
+            try:
+                event_data = json.loads(message)
+            except Exception:
+                pass
+
         log_entry = {
             "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
             "level": record.levelname,
             "module": record.name,
             "request_id": request_id_var.get(),
             "user_id": user_id_var.get(),
-            "event": record.getMessage(),
+            "event": event_data,
         }
         return json.dumps(log_entry, ensure_ascii=False)
-
-
-# Configure root logger once on import
-_handler = logging.StreamHandler()
-_handler.setFormatter(StructuredFormatter())
-logging.root.handlers = [_handler]
-logging.root.setLevel(logging.INFO)
 
 
 def get_logger(name: str) -> logging.Logger:
     """Return a logger that outputs structured JSON."""
     return logging.getLogger(name)
+
+
+def setup_logging():
+    """
+    Unified logging setup. 
+    1. Configures the root logger with the StructuredFormatter.
+    2. Hijacks uvicorn loggers to use the same formatter.
+    """
+    handler = logging.StreamHandler()
+    handler.setFormatter(StructuredFormatter())
+
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.handlers = [handler]
+    root_logger.setLevel(logging.INFO)
+
+    # Hijack uvicorn loggers
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uj_logger = logging.getLogger(logger_name)
+        uj_logger.handlers = [handler]
+        uj_logger.propagate = False  # prevent double logs if root also has handler
+
+    root_logger.info("Structured logging system initialized and connected to uvicorn")
 
 
 def trace_latency(event_name: str | None = None):

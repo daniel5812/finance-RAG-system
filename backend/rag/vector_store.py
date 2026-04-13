@@ -43,7 +43,13 @@ async def search(pinecone_index: Any, query_vector, role: str, top_k: int, filte
         ),
         timeout=PINECONE_TIMEOUT
     )
-    return results["matches"]
+    # Filter by similarity threshold (enforce >= 0.70)
+    filtered_matches = [m for m in results["matches"] if m["score"] >= 0.70]
+    
+    if not filtered_matches:
+        logger.info(f"No matches found above similarity threshold (0.70) for query.")
+        
+    return filtered_matches
 
 
 async def upsert(pinecone_index: Any, chunk_id: str, vector, text: str, role: str,
