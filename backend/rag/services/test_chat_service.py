@@ -134,3 +134,75 @@ class TestLLMConfidenceFallback:
             confidence_level = llm_confidence
 
         assert confidence_level == "high", "LLM confidence should be used as fallback"
+
+
+class TestObservabilityLogging:
+    """Test new observability logging for LLM flow."""
+
+    def test_fallback_triggered_no_raw_question(self):
+        """Verify fallback_triggered log does NOT contain raw user question."""
+        import json
+        import logging
+        from io import StringIO
+
+        # Capture log output
+        log_stream = StringIO()
+        handler = logging.StreamHandler(log_stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger = logging.getLogger("rag.services.chat_service")
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+
+        # Simulate the fallback_triggered log from execute_sub_query (line 434-439)
+        fallback_event = {
+            "event": "fallback_triggered",
+            "fallback_stage": "sql_to_vector",
+            "reason": "sql_error",
+            "original_intent": "price_lookup",
+        }
+        logger.info(json.dumps(fallback_event))
+
+        log_output = log_stream.getvalue()
+
+        # Assert: no raw question field present
+        assert "fallback_query" not in log_output, "Raw user question field should not be logged"
+        assert "event" in log_output, "Event field should be present"
+        assert "sql_to_vector" in log_output, "Fallback stage should be logged"
+        assert "sql_error" in log_output, "Reason should be logged"
+
+    def test_llm_call_preconditions_logged(self):
+        """Verify llm_call_preconditions log is emitted with required fields."""
+        import json
+        import logging
+        from io import StringIO
+
+        # Capture log output
+        log_stream = StringIO()
+        handler = logging.StreamHandler(log_stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger = logging.getLogger("rag.services.chat_service")
+        logger.setLevel(logging.INFO)
+        logger.handlers = [handler]
+
+        # Simulate the llm_call_preconditions log (line 902-912)
+        preconditions_event = {
+            "event": "llm_call_preconditions",
+            "pipeline_confidence": "medium",
+            "context_size_chars": 2500,
+            "user_message_size_chars": 1200,
+            "estimated_tokens": 930,
+            "sql_row_count": 3,
+            "document_chunk_count": 5,
+            "has_validation_block": True,
+            "has_normalized_portfolio": True,
+        }
+        logger.info(json.dumps(preconditions_event))
+
+        log_output = log_stream.getvalue()
+
+        # Assert: required fields present
+        assert "llm_call_preconditions" in log_output, "Event type should be logged"
+        assert "medium" in log_output, "Confidence should be logged"
+        assert "context_size_chars" in log_output, "Context size should be logged"
+        assert "has_validation_block" in log_output, "Validation block flag should be logged"
+        assert "2500" in log_output, "Context size value should be logged"

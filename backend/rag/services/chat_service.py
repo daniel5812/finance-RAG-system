@@ -28,6 +28,7 @@ from typing import Any
 
 from rag.orchestrator import QueryOrchestrator
 from rag.sql_tool import run_sql_query
+from rag.router import _rewrite_for_semantic_search
 from financial.services.user_profile_service import UserProfileService
 from intelligence.orchestrator import IntelligenceOrchestrator
 from intelligence.context_builder import build_intelligence_context
@@ -400,11 +401,11 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
         logger.info(f"executing_sql: {plan.query}")
         result = await run_sql_query(pool, plan.query)
         sql_time = time.time() - t_sql
-        
+
         # Explicit fallback if SQL returns no data or error
         if result and "error" not in result[0]:
             logger.info(f"sql_results: {len(result)} rows")
-            
+
             # 🛡️ Security: Mask internal schema/queries, provide safe labels
             table_label = "Financial Data"
             q_lower = plan.query.lower()
@@ -416,7 +417,7 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
             sql_text = f"{table_label} Result:\n{_format_sql_rows_as_text(result)}"
             tag = f"[S{len(contexts) + 1}]"
             contexts.append(f"Source {tag}: {sql_text}")
-            
+
             citation_mapping[tag] = {
                 "source_type": "sql",
                 "id": "sql_query",
@@ -430,8 +431,26 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
                 "rerank_score": 1.0
             })
         else:
+            # ─ Fallback: SQL failed, switching to vector ─
+            logger.info(json.dumps({
+                "event": "fallback_triggered",
+                "fallback_stage": "sql_to_vector",
+                "reason": "sql_no_results" if not result else "sql_error",
+                "original_intent": getattr(plan, "intent", None),
+            }))
             plan.source = "vector"
-            plan.query = query.question # Crucial: Search docs with question, not failed SQL string
+            # Infer context hint from the failed SQL query to guide semantic rewriting
+            context_hint = "document_analysis"  # default
+            if "fx_rates" in plan.query.lower():
+                context_hint = "fx_rate"
+            elif "prices" in plan.query.lower():
+                context_hint = "price_lookup"
+            elif "macro_series" in plan.query.lower():
+                context_hint = "macro_series"
+            elif "etf_holdings" in plan.query.lower():
+                context_hint = "etf_holdings"
+            # Rewrite question for semantic search: removes fillers, stop words, adds context suffix
+            plan.query = _rewrite_for_semantic_search(query.question, context_hint)
 
     if plan.source == "vector":
         t_emb = time.time()
@@ -643,6 +662,29 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     retrieval_time = time.time() - t_ret_start
 
     relevant_contexts, sources, metrics, citations = merge_contexts(sub_results)
+
+    # ─ After Context Assembly: High-signal routing & context metadata ─
+    has_sql_context = any(s.get("source_type") == "sql" for s in sources)
+    has_vector_context = any(s.get("source_type") != "sql" for s in sources)
+    sql_row_count = sum(
+        len(s.get("chunk_text", "").split("\n"))
+        for s in sources if s.get("source_type") == "sql"
+    )
+    document_chunk_count = len([s for s in sources if s.get("source_type") != "sql"])
+
+    logger.info(json.dumps({
+        "event": "context_assembly_complete",
+        "request_id": getattr(query, "request_id", None),
+        "owner_id_exists": bool(query.owner_id),
+        "intent": intent,
+        "route_count": len(multi_plan.plans),
+        "has_sql_context": has_sql_context,
+        "has_vector_context": has_vector_context,
+        "sql_row_count": sql_row_count,
+        "document_chunk_count": document_chunk_count,
+        "context_count": len(relevant_contexts),
+    }))
+
     obs.emit(
         PipelineStage.VECTOR_RETRIEVAL, "retrieval_complete",
         summary=f"Retrieved {len(relevant_contexts)} context chunk(s) from {len(multi_plan.plans)} plan(s)",
@@ -681,6 +723,8 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     pipeline_confidence: str | None = None   # deterministic — overrides LLM self-reported confidence
     _intelligence_report = None
     _system_action: str | None = None
+    _confidence_before_validation: str | None = None
+    _downgrade_happened: bool = False
     t_intel = time.time()
     try:
         intelligence_report = await IntelligenceOrchestrator.run(
@@ -691,16 +735,38 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             pool=pool,
         )
         _intelligence_report = intelligence_report
+        _confidence_before_validation = intelligence_report.pipeline_confidence
         pipeline_confidence = intelligence_report.pipeline_confidence
         intelligence_block = build_intelligence_context(intelligence_report)
         _val_flags = (
             intelligence_report.validation_result.flags
             if intelligence_report.validation_result else []
         )
+        _val_flags_count = len(_val_flags)
+
+        # Detect if validation downgraded confidence
+        if intelligence_report.validation_result and intelligence_report.validation_result.confidence_override:
+            if intelligence_report.validation_result.confidence_override != _confidence_before_validation:
+                _downgrade_happened = True
+                pipeline_confidence = intelligence_report.validation_result.confidence_override
+
         _system_action = (
             intelligence_report.recommendation.action
             if getattr(intelligence_report, "recommendation", None) else None
         )
+
+        # ─ After Intelligence Pipeline: Confidence tracking & validation state ─
+        logger.info(json.dumps({
+            "event": "intelligence_pipeline_complete",
+            "selected_action": str(_system_action) if _system_action else None,
+            "confidence_before_validation": _confidence_before_validation,
+            "final_confidence": pipeline_confidence,
+            "downgrade_happened": _downgrade_happened,
+            "validation_flags_count": _val_flags_count,
+            "agents_ran": intelligence_report.agents_ran,
+            "has_recommendations": intelligence_report.has_recommendations,
+        }))
+
         logger.info(json.dumps({
             "event": "intelligence_layer_complete",
             "agents_ran": intelligence_report.agents_ran,
@@ -735,6 +801,9 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             exc=intel_err,
         )
         _val_flags = []
+        _val_flags_count = 0
+        _confidence_before_validation = None
+        _downgrade_happened = False
 
     user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
                                       intelligence_block=intelligence_block)
@@ -833,6 +902,25 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             message=f"LLM semaphore wait exceeded {LLM_WAIT_TIMEOUT}s — server overloaded",
         )
         raise HTTPException(503, "Server busy — too many concurrent LLM requests. Try again in a few seconds.")
+
+    # ─ Right Before LLM Call: Precondition metrics ─
+    _context_size_chars = len(context_block)
+    _user_msg_size_chars = len(user_message)
+    _estimated_tokens = round((_context_size_chars + _user_msg_size_chars) / 4)  # rough approximation
+    _has_validation_block = bool(_intelligence_report and _intelligence_report.validation_result)
+    _has_normalized_portfolio = bool(_intelligence_report and _intelligence_report.normalized_portfolio)
+
+    logger.info(json.dumps({
+        "event": "llm_call_preconditions",
+        "pipeline_confidence": pipeline_confidence,
+        "context_size_chars": _context_size_chars,
+        "user_message_size_chars": _user_msg_size_chars,
+        "estimated_tokens": _estimated_tokens,
+        "sql_row_count": sql_row_count if 'sql_row_count' in locals() else 0,
+        "document_chunk_count": document_chunk_count if 'document_chunk_count' in locals() else 0,
+        "has_validation_block": _has_validation_block,
+        "has_normalized_portfolio": _has_normalized_portfolio,
+    }))
 
     t_llm = time.time()
     try:
@@ -1177,15 +1265,7 @@ async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embe
         logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
 
     # 🔹 Build metadata for LLM tracing
-    _llm_input_blocks = build_llm_input_blocks(
-        has_normalized_portfolio=has_portfolio,
-        has_market_context=True,  # Macro is usually injected by IntelligenceOrchestrator
-        has_validation_block=True,
-        has_vector_context=has_context,
-        has_sql_context=any(p.get('tool') == 'sql' for p in multi_plan.plans),
-        intelligence_block=stream_intelligence_report,
-        context_block=context_block
-    )
+    _llm_input_blocks = build_llm_input_blocks(stream_intelligence_block, context_block, portfolio_ctx)
     _system_action = "EXPLANATION" if not has_portfolio else "SYNTHESIS" # Baseline
     if intent == "advisory": _system_action = "ADVISORY"
 

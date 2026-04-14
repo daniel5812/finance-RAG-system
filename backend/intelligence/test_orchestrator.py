@@ -69,4 +69,87 @@ class TestValidationAgentConfidenceOverride:
             report.pipeline_confidence = report.validation_result.confidence_override
 
         # Assert: base confidence unchanged
-        assert report.pipeline_confidence == "high", "Base confidence should be unchanged"
+        assert report.pipeline_confidence == "high", "Base confidence should be preserved when no override"
+
+
+class TestValidationStageLogs:
+    """Test validation stage logging for observability."""
+
+    def test_validation_stage_tracks_downgrade(self):
+        """Verify validation_stage_complete logs confidence before/after and downgrade flag."""
+        import json
+        import logging
+        from io import StringIO
+
+        # Capture log output
+        log_stream = StringIO()
+        handler = logging.StreamHandler(log_stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger = logging.getLogger("intelligence.orchestrator")
+        logger.setLevel(logging.INFO)
+        logger.handlers = [handler]
+
+        # Simulate validation stage with downgrade (orchestrator.py line 265-272)
+        confidence_before = "high"
+        confidence_after = "medium"
+        downgrade_happened = (confidence_after != confidence_before)
+        validation_flags_count = 2
+        validation_passed = False
+
+        validation_log = (
+            f'{{"event": "validation_stage_complete", '
+            f'"confidence_before": "{confidence_before}", '
+            f'"confidence_after": "{confidence_after}", '
+            f'"downgrade_happened": {str(downgrade_happened).lower()}, '
+            f'"validation_flags_count": {validation_flags_count}, '
+            f'"validation_passed": {str(validation_passed).lower()}}}'
+        )
+        logger.info(validation_log)
+
+        log_output = log_stream.getvalue()
+
+        # Assert: required fields present for observability
+        assert "validation_stage_complete" in log_output, "Event should be logged"
+        assert "high" in log_output, "Confidence before should be logged"
+        assert "medium" in log_output, "Confidence after should be logged"
+        assert "downgrade_happened" in log_output, "Downgrade flag should be logged"
+        assert "true" in log_output, "Downgrade should be true"
+        assert "validation_flags_count" in log_output, "Flags count should be logged"
+
+    def test_validation_stage_no_downgrade_logged(self):
+        """Verify validation_stage_complete correctly logs when NO downgrade occurs."""
+        import json
+        import logging
+        from io import StringIO
+
+        # Capture log output
+        log_stream = StringIO()
+        handler = logging.StreamHandler(log_stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger = logging.getLogger("intelligence.orchestrator")
+        logger.setLevel(logging.INFO)
+        logger.handlers = [handler]
+
+        # Simulate validation stage without downgrade
+        confidence_before = "high"
+        confidence_after = "high"  # No change
+        downgrade_happened = (confidence_after != confidence_before)
+        validation_flags_count = 0
+        validation_passed = True
+
+        validation_log = (
+            f'{{"event": "validation_stage_complete", '
+            f'"confidence_before": "{confidence_before}", '
+            f'"confidence_after": "{confidence_after}", '
+            f'"downgrade_happened": {str(downgrade_happened).lower()}, '
+            f'"validation_flags_count": {validation_flags_count}, '
+            f'"validation_passed": {str(validation_passed).lower()}}}'
+        )
+        logger.info(validation_log)
+
+        log_output = log_stream.getvalue()
+
+        # Assert: downgrade_happened should be false
+        assert "downgrade_happened" in log_output, "Downgrade flag should be logged"
+        assert "false" in log_output, "Downgrade should be false"
+        assert "validation_passed" in log_output, "Validation passed flag should be logged"

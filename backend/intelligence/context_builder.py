@@ -35,10 +35,29 @@ def build_intelligence_context(report: IntelligenceReport) -> str:
     if report.is_empty:
         return ""
 
+    # ─ Context Builder: Track what's being injected ─
+    from core.logger import get_logger
+    logger = get_logger(__name__)
+
+    # Log which blocks will be included (for observability)
+    logger.info(
+        f'{{"event": "intelligence_context_building", '
+        f'"has_user_profile": {bool(report.user_profile)}, '
+        f'"has_market_context": {bool(report.market_context)}, '
+        f'"has_asset_profiles": {bool(report.asset_profiles)}, '
+        f'"has_normalized_portfolio": {bool(report.normalized_portfolio)}, '
+        f'"has_portfolio_fit": {bool(report.portfolio_fit)}, '
+        f'"has_portfolio_gap_analysis": {bool(report.portfolio_gap_analysis)}, '
+        f'"has_asset_scores": {bool(report.asset_scores)}, '
+        f'"has_recommendations": {bool(report.recommendations)}, '
+        f'"has_validation_result": {bool(report.validation_result)}, '
+        f'"pipeline_confidence": "{report.pipeline_confidence}"}}'
+    )
+
     sections: list[str] = [
         "╔══ INVESTMENT INTELLIGENCE LAYER ══╗",
-        f"Pipeline confidence: {report.pipeline_confidence.upper()}",
-        f"LLM Mode: {report.llm_mode.upper()}",
+        f"Pipeline confidence: {(report.pipeline_confidence or 'low').upper()}",
+        f"LLM Mode: {(report.llm_mode or 'explanation').upper()}",
         f"Agents ran: {', '.join(report.agents_ran) or 'none'}",
     ]
 
@@ -284,9 +303,4 @@ def _render_validation(vr: ValidationResult) -> str:
         f" Pipeline confidence downgraded to: {vr.confidence_override.upper()}."
         if vr.confidence_override else ""
     )
-    return (
-        f"[VALIDATION — ISSUES DETECTED]{override_note}\n"
-        f"  The following inconsistencies were found in the pipeline output.\n"
-        f"  You MUST reflect reduced confidence in your response:\n"
-        f"{flag_lines}"
-    )
+    return f"[VALIDATION] ⚠ Found potential logical inconsistencies:\n{flag_lines}\n{override_note}"

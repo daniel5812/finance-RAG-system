@@ -244,15 +244,32 @@ class IntelligenceOrchestrator:
 
             # ── Pipeline confidence (base — deterministic from data quality) ─
             report.pipeline_confidence = _compute_pipeline_confidence(report)
+            _confidence_before_validation = report.pipeline_confidence
 
             # ── Stage 4: Validation (runs AFTER base confidence is set) ─────
             # ValidationAgent may downgrade pipeline_confidence if it finds issues.
+            _downgrade_happened = False
+            _validation_flags_count = 0
             try:
                 validation_result = ValidationAgent.run(report)
                 report.validation_result = validation_result
                 report.agents_ran.append("ValidationAgent")
+
+                _validation_flags_count = len(validation_result.flags) if validation_result.flags else 0
+
                 if validation_result.confidence_override:
+                    _downgrade_happened = (validation_result.confidence_override != _confidence_before_validation)
                     report.pipeline_confidence = validation_result.confidence_override
+
+                # ─ Validation Stage: Track confidence changes ─
+                logger.info(
+                    f'{{"event": "validation_stage_complete", '
+                    f'"confidence_before": "{_confidence_before_validation}", '
+                    f'"confidence_after": "{report.pipeline_confidence}", '
+                    f'"downgrade_happened": {_downgrade_happened}, '
+                    f'"validation_flags_count": {_validation_flags_count}, '
+                    f'"validation_passed": {validation_result.passed}}}'
+                )
             except Exception as exc:
                 logger.warning(
                     f'{{"event": "orchestrator", "agent": "ValidationAgent", '
@@ -349,11 +366,6 @@ def _compute_pipeline_confidence(report: IntelligenceReport) -> str:
         return "low"
 
     # Explanation/asset mode: confidence from scores and market data
-    if mc and mc.regime_confidence == "high" and len(report.asset_scores) > 0:
-        all_full = all(s.data_coverage == "full" for s in report.asset_scores)
-        return "high" if all_full else "medium"
-    if mc and mc.regime_confidence in ("high", "medium"):
-        return "medium"
-    if report.user_profile:
-        return "low"
-    return "none"
+    if report.asset_scores and any(s.data_coverage == "full" for s in report.asset_scores):
+        return "medium" if mc else "low"
+    return "low"  # safe floor — never return None
