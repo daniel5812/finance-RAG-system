@@ -13,8 +13,8 @@ import { Sidebar } from "@/components/Sidebar";
 import { SettingsModal } from "@/components/SettingsModal";
 import { UserProfile } from "@/components/UserProfile";
 
-import { sendChat, sendChatStream, fetchDocuments, fetchUserProfile, updateUserProfile, listSessions, getSessionMessages, deleteSession, createSession, deleteDocument, fetchFolders, createFolder, deleteFolder, setDocumentFolder } from "@/lib/api";
-import type { Citation, LatencyBreakdown, UploadedDocument, QueryExecution, EngineMode, UserProfile as UserProfileType, ChatSession, UserProfileUpdatePayload, Folder } from "@/lib/api";
+import { sendChat, sendChatStream, sendChatV2, fetchDocuments, fetchUserProfile, updateUserProfile, listSessions, getSessionMessages, deleteSession, createSession, deleteDocument, fetchFolders, createFolder, deleteFolder, setDocumentFolder } from "@/lib/api";
+import type { Citation, LatencyBreakdown, UploadedDocument, QueryExecution, ChatMode, UserProfile as UserProfileType, ChatSession, UserProfileUpdatePayload, Folder } from "@/lib/api";
 import { getUser } from "@/lib/auth";
 import { Settings as SettingsIcon, MessageSquare } from "lucide-react";
 
@@ -36,9 +36,10 @@ export default function Index() {
   const [focusedCitation, setFocusedCitation] = useState<string | null>(null);
   const [showSources, setShowSources] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [engineMode, setEngineMode] = useState<EngineMode | null>(null);
+  const [engineMode, setEngineMode] = useState<ChatMode | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [userSettings, setUserSettings] = useState<UserProfileType>({ user_id: getUser()?.id || "unknown", custom_persona: null, risk_tolerance: "medium", preferred_style: "deep", interests: [] });
+  const [useRagV2TestMode, setUseRagV2TestMode] = useState(true);
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -219,6 +220,28 @@ export default function Index() {
     setIsLoading(true);
 
     try {
+      if (useRagV2TestMode) {
+        console.info("[rag_v2] UI test mode enabled");
+        const response = await sendChatV2(content);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: response.answer,
+            citations: response.citations,
+            latency: response.latency_breakdown,
+            queryExecution: response.query_execution,
+            suggestedQuestions: undefined,
+          },
+        ]);
+        setEngineMode("rag_v2");
+        if (response.citations && Object.keys(response.citations).length > 0) {
+          setActiveCitations(response.citations);
+          setShowSources(true);
+        }
+        return;
+      }
+
       // 🔹 0. Create session if it doesn't exist
       let sessionId = activeSessionId;
       if (!sessionId) {
@@ -289,7 +312,7 @@ export default function Index() {
     } finally {
       setIsLoading(false);
     }
-  }, [messages, activeSessionId, selectedDocumentIds]);
+  }, [messages, activeSessionId, selectedDocumentIds, useRagV2TestMode]);
 
   const handleCitationClick = useCallback((_key: string, citation: Citation) => {
     if (citation.source_type === "document") {
@@ -338,10 +361,11 @@ export default function Index() {
     );
   }, []);
 
-  const engineModeLabel: Record<EngineMode, string> = {
+  const engineModeLabel: Record<ChatMode, string> = {
     generated: "AI Analysis",
     cache: "Result Cache",
     semantic_cache: "Semantic Knowledge",
+    rag_v2: "RAG V2 Test",
   };
 
   return (

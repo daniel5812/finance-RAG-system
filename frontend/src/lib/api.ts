@@ -45,6 +45,7 @@ export interface LatencyBreakdown {
 }
 
 export type EngineMode = "generated" | "cache" | "semantic_cache";
+export type ChatMode = EngineMode | "rag_v2";
 
 export interface QueryExecution {
   type: "sql" | "vector" | "hybrid";
@@ -57,13 +58,23 @@ export interface ChatResponse {
   sources: any[];
   citations: Record<string, Citation>;
   latency_breakdown: LatencyBreakdown;
-  source_type: EngineMode;
+  source_type: ChatMode;
   query_execution?: QueryExecution;
   suggested_questions?: string[];
   session_id?: string;
   // Explainability
   reasoning_summary?: string;
   confidence_level?: "low" | "medium" | "high";
+}
+
+interface ChatResponseV2Api {
+  answer: string;
+  source_type: "sql" | "unsupported" | "none";
+  citations: string[];
+  debug_trace?: {
+    assembled_context?: string;
+    executed_query?: string | null;
+  };
 }
 
 export interface ChatSession {
@@ -138,6 +149,55 @@ export async function sendChat(question: string, history: { role: string, conten
   });
   if (!res.ok) throw new Error(`Chat failed: ${res.statusText}`);
   return res.json();
+}
+
+export async function sendChatV2(question: string): Promise<ChatResponse> {
+  console.info("[rag_v2] sending request to /chat-v2", { question });
+
+  const res = await authenticatedFetch(`${API_BASE}/chat-v2`, {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
+
+  if (!res.ok) throw new Error(`Chat v2 failed: ${res.statusText}`);
+
+  const data: ChatResponseV2Api = await res.json();
+  const context = data.debug_trace?.assembled_context || "";
+  const executedQuery = data.debug_trace?.executed_query;
+  const hasCitation = data.citations.includes("[S1]") && context;
+
+  return {
+    answer: data.answer,
+    sources: [],
+    citations: hasCitation
+      ? {
+          S1: {
+            source_type: "sql",
+            id: "sql_query",
+            display_name: "SQL Context [S1]",
+            context,
+          },
+        }
+      : {},
+    latency_breakdown: {
+      planning: 0,
+      sql: 0,
+      embedding: 0,
+      routing: 0,
+      retrieval: 0,
+      rerank: 0,
+      generation: 0,
+      total: 0,
+    },
+    source_type: "rag_v2",
+    query_execution: executedQuery
+      ? {
+          type: "sql",
+          queries: [executedQuery],
+        }
+      : undefined,
+    suggested_questions: [],
+  };
 }
 
 export async function sendChatStream(

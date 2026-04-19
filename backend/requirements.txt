@@ -22,3 +22,4 @@ pypdf              # PDF text extraction — used in documents/worker.py (Stage 
 python-jose[cryptography]
 google-auth
 passlib[bcrypt]
+yfinance

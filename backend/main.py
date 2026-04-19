@@ -3,8 +3,8 @@ from fastapi import FastAPI
 
 from core.routes.health import router as health_router
 from rag.routes import ingest as rag_ingest
-from rag.routes import chat as rag_chat
 from rag.routes import sessions as rag_sessions
+from rag_v2 import routes as rag_v2_routes
 from financial.routes import router as financial_router
 from documents.routes import router as doc_router
 from core.routes.user import router as user_router
@@ -65,8 +65,8 @@ app.add_middleware(
 # ── Include Routers ──
 app.include_router(health_router)           # GET /health, GET /metrics
 app.include_router(rag_ingest.router)       # POST /ingest
-app.include_router(rag_chat.router)         # POST /chat, POST /chat/stream
 app.include_router(rag_sessions.router)     # GET/POST /chat/sessions
+app.include_router(rag_v2_routes.router)    # POST /chat-v2, POST /chat-v2/debug
 app.include_router(financial_router)        # POST /financial/ingest/*
 app.include_router(doc_router)              # POST /documents/upload
 app.include_router(user_router)             # GET/POST /user/settings

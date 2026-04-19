@@ -245,12 +245,68 @@ async def save_message_to_db(pool: asyncpg.Pool, session_id: str, role: str, con
         except Exception as e:
             logger.error(f"Failed to update session title: {e}")
 
+# Regex for a likely stock ticker embedded in a question (2–5 uppercase letters,
+# not a currency code or FRED series ID).  Used to detect "price data" queries.
+_PRICE_TICKER_RE = re.compile(r'\b[A-Z]{2,5}\b')
+_PRICE_QUERY_NONTICKER = frozenset({
+    # Currency ISO codes
+    "USD", "ILS", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD",
+    # Macro / financial abbreviations that are NOT tickers
+    "CPI", "GDP", "FED", "ETF", "NYSE", "AMEX",
+    # Common 2-letter English words (all caps from question.upper())
+    "IS", "IT", "OF", "IN", "AT", "TO", "BY", "AS", "OR", "AN",
+    "IF", "ON", "DO", "BE", "GO", "MY", "VS",
+    # Common 3-letter English words
+    "THE", "AND", "FOR", "NOT", "YOU", "ALL", "CAN", "WAS", "ONE",
+    "NEW", "NOW", "SEE", "WHO", "DID", "LET", "PUT", "SAY", "SHE",
+    "TOO", "USE", "WAY", "ITS", "BUT", "HAS", "HAD", "ARE", "HOW",
+    "WHY", "HIM", "HIS", "HER", "OUR", "GET",
+    # Common 4-letter English words
+    "WHAT", "THAT", "THIS", "WHEN", "WITH", "WILL", "JUST", "FROM",
+    "HAVE", "BEEN", "WERE", "THEY", "THEM", "THAN", "THEN", "SOME",
+    "MORE", "ALSO", "INTO", "OVER", "SUCH", "MUCH", "VERY", "DOES",
+    "MAKE", "TAKE", "COME", "TELL", "SHOW", "GIVE", "LAST", "WEEK",
+    "YEAR", "HIGH", "HOLD", "SELL", "FUND", "BOND", "RISK", "GAIN",
+    "LOSS", "COST", "OPEN", "DROP", "JUMP", "MOVE", "DATA",
+    # Common 5-letter English / financial domain words
+    "STOCK", "PRICE", "TRADE", "CLOSE", "TREND", "CHART", "ABOUT",
+    "AFTER", "COULD", "WOULD", "THEIR", "WHICH", "THESE", "THOSE",
+    "GIVEN", "SHARE", "INDEX", "ASSET",
+})
+_PRICE_QUERY_INDICATORS = ("price", "stock price", "trading at", "close", "chart")
+
+
+def _is_price_data_query(question: str) -> bool:
+    """
+    Return True when the question is fundamentally asking for specific price
+    data for a named ticker (e.g. "Explain the trend of AAPL stock price").
+
+    Such queries should stay in 'factual' mode even if they contain words like
+    'explain' or 'trend' that would otherwise trigger the full intelligence layer.
+    They are answered by a SQL price_lookup + lightweight synthesis — not by the
+    heavy advisory/portfolio pipeline.
+
+    Criteria: question contains a price indicator AND at least one ticker-like
+    token that is NOT a currency code or known non-ticker abbreviation.
+    """
+    q_lower = question.lower()
+    if not any(ind in q_lower for ind in _PRICE_QUERY_INDICATORS):
+        return False
+    tokens = _PRICE_TICKER_RE.findall(question.upper())
+    return any(t not in _PRICE_QUERY_NONTICKER for t in tokens)
+
+
 def classify_intent(question: str) -> str:
     """Rule-based intent classification. Returns: factual / analytical / advisory."""
     q = question.lower()
     if any(kw in q for kw in ADVISORY_KEYWORDS):
         return "advisory"
     if any(kw in q for kw in ANALYTICAL_KEYWORDS):
+        # Pure price-data queries ("Explain the trend of AAPL stock price") must NOT
+        # trigger the heavy advisory/intelligence pipeline just because they contain
+        # 'explain' or 'trend'.  They are factual SQL lookups with light synthesis.
+        if _is_price_data_query(question):
+            return "factual"
         return "analytical"
     return "factual"
 
@@ -395,14 +451,18 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
     sources = []
     
     citation_mapping = {}
-    
+
+    # Track original routing decision so the vector block cannot run
+    # as an implicit fallback from a SQL plan.
+    original_source = plan.source
+
     if plan.source == "sql":
         t_sql = time.time()
         logger.info(f"executing_sql: {plan.query}")
         result = await run_sql_query(pool, plan.query)
         sql_time = time.time() - t_sql
 
-        # Explicit fallback if SQL returns no data or error
+        # V2: SQL-first determinism — no implicit fallback
         if result and "error" not in result[0]:
             logger.info(f"sql_results: {len(result)} rows")
 
@@ -426,33 +486,28 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
             }
             sources.append({
                 "document_id": "sql_query",
+                "source_type": "sql",
                 "chunk_text": sql_text,
                 "vector_score": 1.0,
                 "rerank_score": 1.0
             })
         else:
-            # ─ Fallback: SQL failed, switching to vector ─
+            # V2 GUARANTEE: SQL returns empty → explicit "no data" state
+            # NO implicit fallback to vector. The validation/synthesis layer
+            # will generate explicit "data not available" message.
+            reason = "sql_no_results" if not result else "sql_error"
             logger.info(json.dumps({
-                "event": "fallback_triggered",
-                "fallback_stage": "sql_to_vector",
-                "reason": "sql_no_results" if not result else "sql_error",
+                "event": "sql_no_results",
+                "query": plan.query,
+                "reason": reason,
                 "original_intent": getattr(plan, "intent", None),
             }))
-            plan.source = "vector"
-            # Infer context hint from the failed SQL query to guide semantic rewriting
-            context_hint = "document_analysis"  # default
-            if "fx_rates" in plan.query.lower():
-                context_hint = "fx_rate"
-            elif "prices" in plan.query.lower():
-                context_hint = "price_lookup"
-            elif "macro_series" in plan.query.lower():
-                context_hint = "macro_series"
-            elif "etf_holdings" in plan.query.lower():
-                context_hint = "etf_holdings"
-            # Rewrite question for semantic search: removes fillers, stop words, adds context suffix
-            plan.query = _rewrite_for_semantic_search(query.question, context_hint)
+            # Return empty contexts — LLM will synthesize explicit error message
+            contexts = []
+            sources = []
+            citation_mapping = {}
 
-    if plan.source == "vector":
+    if plan.source == "vector" and original_source == "vector":
         t_emb = time.time()
         query_vector = await cached_embed(plan.query, loop)
         embed_time = time.time() - t_emb
@@ -627,7 +682,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     query_vector = await cached_embed(query.question, loop)
     
     # 🔹 1.5 SEMANTIC CACHE LOOKUP
-    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id)
+    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id, question=query.question)
     if sem_result is not None:
         logger.info(json.dumps({"event": "semantic_cache_hit"}))
         obs.emit(PipelineStage.CACHE, "semantic_cache_hit",
@@ -642,7 +697,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     # 🔹 2. QUERY PLANNING (Stage 11: Orchestrated)
     t_plan = time.time()
-    multi_plan = await QueryOrchestrator.get_plan(query.question, query_vector, query.user_role)
+    multi_plan = await QueryOrchestrator.get_plan(query.question, query_vector, query.user_role, owner_id=query.owner_id)
     plan_time = time.time() - t_plan
     obs.emit(
         PipelineStage.ROUTER, "router_plan_built",
@@ -719,6 +774,19 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     # 🔹 5.5 INVESTMENT INTELLIGENCE LAYER
     # Runs between retrieval and LLM synthesis. Failure is isolated — never crashes the pipeline.
+    # Determine if Intelligence Layer is needed based on explicit signals, not just intent.
+    # Intelligence Layer is needed only when intent explicitly signals advisory/analytical reasoning.
+    # Portfolio context is injected into the prompt separately via portfolio_ctx and does NOT
+    # alone justify running heavy agents on factual price/FX/macro/ETF queries.
+    requires_intelligence = intent in ("advisory", "analytical", "simulation")
+
+    logger.info(json.dumps({
+        "event": "intelligence_requirement_check",
+        "intent": intent,
+        "has_portfolio": portfolio_ctx is not None,
+        "requires_intelligence": requires_intelligence,
+    }))
+
     intelligence_block = ""
     pipeline_confidence: str | None = None   # deterministic — overrides LLM self-reported confidence
     _intelligence_report = None
@@ -726,84 +794,95 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     _confidence_before_validation: str | None = None
     _downgrade_happened: bool = False
     t_intel = time.time()
-    try:
-        intelligence_report = await IntelligenceOrchestrator.run(
-            question=standalone_question,
-            intent=intent,
-            raw_profile=user_profile,   # may be None — orchestrator handles gracefully
-            owner_id=query.owner_id,
-            pool=pool,
-        )
-        _intelligence_report = intelligence_report
-        _confidence_before_validation = intelligence_report.pipeline_confidence
-        pipeline_confidence = intelligence_report.pipeline_confidence
-        intelligence_block = build_intelligence_context(intelligence_report)
-        _val_flags = (
-            intelligence_report.validation_result.flags
-            if intelligence_report.validation_result else []
-        )
-        _val_flags_count = len(_val_flags)
 
-        # Detect if validation downgraded confidence
-        if intelligence_report.validation_result and intelligence_report.validation_result.confidence_override:
-            if intelligence_report.validation_result.confidence_override != _confidence_before_validation:
-                _downgrade_happened = True
-                pipeline_confidence = intelligence_report.validation_result.confidence_override
+    if requires_intelligence:
+        try:
+            intelligence_report = await IntelligenceOrchestrator.run(
+                question=standalone_question,
+                intent=intent,
+                raw_profile=user_profile,   # may be None — orchestrator handles gracefully
+                owner_id=query.owner_id,
+                pool=pool,
+            )
+            _intelligence_report = intelligence_report
+            _confidence_before_validation = intelligence_report.pipeline_confidence
+            pipeline_confidence = intelligence_report.pipeline_confidence
+            intelligence_block = build_intelligence_context(intelligence_report)
+            _val_flags = (
+                intelligence_report.validation_result.flags
+                if intelligence_report.validation_result else []
+            )
+            _val_flags_count = len(_val_flags)
 
-        _system_action = (
-            intelligence_report.recommendation.action
-            if getattr(intelligence_report, "recommendation", None) else None
-        )
+            # Detect if validation downgraded confidence
+            if intelligence_report.validation_result and intelligence_report.validation_result.confidence_override:
+                if intelligence_report.validation_result.confidence_override != _confidence_before_validation:
+                    _downgrade_happened = True
+                    pipeline_confidence = intelligence_report.validation_result.confidence_override
 
-        # ─ After Intelligence Pipeline: Confidence tracking & validation state ─
-        logger.info(json.dumps({
-            "event": "intelligence_pipeline_complete",
-            "selected_action": str(_system_action) if _system_action else None,
-            "confidence_before_validation": _confidence_before_validation,
-            "final_confidence": pipeline_confidence,
-            "downgrade_happened": _downgrade_happened,
-            "validation_flags_count": _val_flags_count,
-            "agents_ran": intelligence_report.agents_ran,
-            "has_recommendations": intelligence_report.has_recommendations,
-        }))
+            _system_action = (
+                intelligence_report.recommendation.action
+                if getattr(intelligence_report, "recommendation", None) else None
+            )
 
-        logger.info(json.dumps({
-            "event": "intelligence_layer_complete",
-            "agents_ran": intelligence_report.agents_ran,
-            "confidence": pipeline_confidence,
-            "has_recommendations": intelligence_report.has_recommendations,
-            "validation_passed": (
-                intelligence_report.validation_result.passed
-                if intelligence_report.validation_result else None
-            ),
-        }))
-        obs.emit(
-            PipelineStage.VALIDATION, "intelligence_layer_complete",
-            summary=f"Intelligence pipeline done — confidence={pipeline_confidence}, action={_system_action}",
-            latency_ms=(time.time() - t_intel) * 1000,
-            data={
-                "agents_ran":          intelligence_report.agents_ran,
-                "confidence":          pipeline_confidence,
-                "system_action":       _system_action,
+            # ─ After Intelligence Pipeline: Confidence tracking & validation state ─
+            logger.info(json.dumps({
+                "event": "intelligence_pipeline_complete",
+                "selected_action": str(_system_action) if _system_action else None,
+                "confidence_before_validation": _confidence_before_validation,
+                "final_confidence": pipeline_confidence,
+                "downgrade_happened": _downgrade_happened,
+                "validation_flags_count": _val_flags_count,
+                "agents_ran": intelligence_report.agents_ran,
                 "has_recommendations": intelligence_report.has_recommendations,
-                "validation_passed":   (intelligence_report.validation_result.passed
-                                        if intelligence_report.validation_result else None),
-                "validation_flags":    _val_flags,
-            },
-        )
-    except Exception as intel_err:
-        logger.warning(json.dumps({"event": "intelligence_layer_failed", "error": str(intel_err)}))
-        obs.emit_error(
-            stage=PipelineStage.USER_PROFILER,
-            error_category=ErrorCategory.PIPELINE,
-            error_code="INTELLIGENCE_LAYER_FAILED",
-            message=str(intel_err),
-            exc=intel_err,
-        )
+            }))
+
+            logger.info(json.dumps({
+                "event": "intelligence_layer_complete",
+                "agents_ran": intelligence_report.agents_ran,
+                "confidence": pipeline_confidence,
+                "has_recommendations": intelligence_report.has_recommendations,
+                "validation_passed": (
+                    intelligence_report.validation_result.passed
+                    if intelligence_report.validation_result else None
+                ),
+            }))
+            obs.emit(
+                PipelineStage.VALIDATION, "intelligence_layer_complete",
+                summary=f"Intelligence pipeline done — confidence={pipeline_confidence}, action={_system_action}",
+                latency_ms=(time.time() - t_intel) * 1000,
+                data={
+                    "agents_ran":          intelligence_report.agents_ran,
+                    "confidence":          pipeline_confidence,
+                    "system_action":       _system_action,
+                    "has_recommendations": intelligence_report.has_recommendations,
+                    "validation_passed":   (intelligence_report.validation_result.passed
+                                            if intelligence_report.validation_result else None),
+                    "validation_flags":    _val_flags,
+                },
+            )
+        except Exception as intel_err:
+            logger.warning(json.dumps({"event": "intelligence_layer_failed", "error": str(intel_err)}))
+            obs.emit_error(
+                stage=PipelineStage.USER_PROFILER,
+                error_category=ErrorCategory.PIPELINE,
+                error_code="INTELLIGENCE_LAYER_FAILED",
+                message=str(intel_err),
+                exc=intel_err,
+            )
+            _val_flags = []
+            _val_flags_count = 0
+            _confidence_before_validation = None
+            _downgrade_happened = False
+    else:
+        # Intelligence Layer not required for this query (factual only, no portfolio)
+        logger.info(json.dumps({
+            "event": "intelligence_skipped",
+            "reason": "factual_query_no_portfolio",
+            "intent": intent,
+        }))
         _val_flags = []
         _val_flags_count = 0
-        _confidence_before_validation = None
-        _downgrade_happened = False
 
     user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
                                       intelligence_block=intelligence_block)
@@ -1062,7 +1141,15 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
         "data": result,
         "timestamp": time.time()
     })
-    await semantic_cache_store(query_vector, query.user_role, cache_key, owner_id=query.owner_id)
+    # Semantic cache is only for non-deterministic (vector) queries.
+    # SQL-sourced answers are already covered by the exact-match Redis cache and must
+    # not pollute the semantic cache — a macro/FX answer stored here would be returned
+    # for semantically similar but structurally different ticker queries.
+    _has_sql_sources = any(s.get("source_type") == "sql" for s in sources)
+    if not _has_sql_sources:
+        await semantic_cache_store(query_vector, query.user_role, cache_key, owner_id=query.owner_id, question=query.question)
+    else:
+        logger.info(json.dumps({"event": "semantic_cache_store_skipped", "reason": "sql_result"}))
 
     # 🔹 8. Strict Source Control Logging & Validation
     retrieved_ids = {s['document_id'] for s in sources if s.get('document_id') and s['document_id'] != 'sql_query' and s['document_id'] != 'unknown'}
@@ -1170,11 +1257,11 @@ async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embe
     loop = asyncio.get_running_loop()
     query_vector = await cached_embed(standalone_question, loop)
     t_plan = time.time()
-    multi_plan = await QueryOrchestrator.get_plan(standalone_question, query_vector, query.user_role)
+    multi_plan = await QueryOrchestrator.get_plan(standalone_question, query_vector, query.user_role, owner_id=query.owner_id)
     plan_time = time.time() - t_plan
     
     # 🔹 1. SEMANTIC CACHE LOOKUP (Optional on streaming)
-    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id)
+    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id, question=query.question)
     if sem_result is not None:
         await state.incr_metric(state.METRIC_HIT)
         yield f"data: {json.dumps({'type': 'meta', 'sources': sem_result.get('sources', []), 'source_type': 'semantic_cache'})}\n\n"
@@ -1244,25 +1331,37 @@ async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embe
         intent = "simulation"
 
     # 🔹 5.5 INVESTMENT INTELLIGENCE LAYER (stream path — mirrors sync path)
+    # Intelligence Layer is needed only when intent signals advisory/analytical reasoning.
+    # Portfolio context alone does NOT trigger intelligence for factual queries.
+    stream_requires_intelligence = intent in ("advisory", "analytical", "simulation")
+
     stream_intelligence_block = ""
     stream_pipeline_confidence: str | None = None
-    try:
-        stream_intelligence_report = await IntelligenceOrchestrator.run(
-            question=standalone_question,
-            intent=intent,
-            raw_profile=user_profile,
-            owner_id=query.owner_id,
-            pool=pool,
-        )
-        stream_pipeline_confidence = stream_intelligence_report.pipeline_confidence
-        stream_intelligence_block = build_intelligence_context(stream_intelligence_report)
+
+    if stream_requires_intelligence:
+        try:
+            stream_intelligence_report = await IntelligenceOrchestrator.run(
+                question=standalone_question,
+                intent=intent,
+                raw_profile=user_profile,
+                owner_id=query.owner_id,
+                pool=pool,
+            )
+            stream_pipeline_confidence = stream_intelligence_report.pipeline_confidence
+            stream_intelligence_block = build_intelligence_context(stream_intelligence_report)
+            logger.info(json.dumps({
+                "event": "intelligence_layer_complete_stream",
+                "agents_ran": stream_intelligence_report.agents_ran,
+                "confidence": stream_pipeline_confidence,
+            }))
+        except Exception as intel_err:
+            logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
+    else:
         logger.info(json.dumps({
-            "event": "intelligence_layer_complete_stream",
-            "agents_ran": stream_intelligence_report.agents_ran,
-            "confidence": stream_pipeline_confidence,
+            "event": "intelligence_skipped_stream",
+            "reason": "factual_query_no_portfolio",
+            "intent": intent,
         }))
-    except Exception as intel_err:
-        logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
 
     # 🔹 Build metadata for LLM tracing
     _llm_input_blocks = build_llm_input_blocks(stream_intelligence_block, context_block, portfolio_ctx)

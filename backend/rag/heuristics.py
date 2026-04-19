@@ -30,6 +30,13 @@ MACRO_MAP = {
     "CPI": "CPIAUCNS",
     "GDP": "GDP",
     "UNEMPLOYMENT": "UNRATE",
+    # Fed / interest-rate series — must be present so multi-intent queries like
+    # "What is the Fed rate and USD/ILS rate?" generate BOTH a macro plan AND an FX plan
+    # rather than only the FX plan.
+    "FED RATE": "FEDFUNDS",
+    "FEDERAL FUNDS": "FEDFUNDS",
+    "FEDFUNDS": "FEDFUNDS",
+    "INTEREST RATE": "FEDFUNDS",
 }
 
 class FinancialHeuristics:

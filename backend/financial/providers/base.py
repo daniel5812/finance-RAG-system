@@ -71,7 +71,7 @@ class BaseProvider(ABC):
             rows = self.normalize(raw)
 
             if not rows:
-                await self._log_raw(raw, kwargs, status="empty", rows_ingested=0)
+                await self._log_raw(pool, raw, kwargs, status="empty", rows_ingested=0)
                 return {
                     "provider": self.provider_name,
                     "status": "empty",
