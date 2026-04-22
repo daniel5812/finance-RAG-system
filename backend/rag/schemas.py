@@ -85,3 +85,31 @@ class UserProfileResponse(BaseModel):
     past_queries: List[str] = []
     created_at: Optional[Any] = None
     updated_at: Optional[Any] = None
+
+
+# ── Hybrid Retrieval Planner schemas ─────────────────────────────────────────
+
+class VectorFilter(BaseModel):
+    owner_id: str
+    doc_type: Optional[str] = None
+    ticker: Optional[str] = None
+
+class PlanStep(BaseModel):
+    step_id: int
+    source_type: Literal["SQL", "VECTOR", "NO_MATCH"]
+    intent_type: str
+    parameters: Dict[str, Any] = {}
+    sql_template_id: Optional[str] = None
+    vector_filter: Optional[VectorFilter] = None
+    priority: int = 1
+    execution_mode: Literal["parallel", "sequential"] = "sequential"
+    profile_hint: Optional[Dict[str, Any]] = None
+
+class PlanMeta(BaseModel):
+    total_steps: int
+    is_hybrid: bool
+    fusion_required: bool
+
+class HybridQueryPlan(BaseModel):
+    steps: List[PlanStep]
+    plan_meta: PlanMeta
