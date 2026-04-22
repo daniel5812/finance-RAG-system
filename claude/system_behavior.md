@@ -113,7 +113,13 @@ QueryPlan
 - Planner: IMPLEMENTED + tested (backend/rag/planner.py, backend/tests/test_planner.py)
 - Executor: IMPLEMENTED + tested (backend/rag/executor.py, backend/tests/test_executor.py)
 - Fusion: IMPLEMENTED + tested (backend/rag/fusion.py, backend/tests/test_fusion.py)
-- Retrieval pipeline: integration tests present (backend/tests/test_retrieval_pipeline.py) — plan → execute → fuse flow verified
+- Session memory: IMPLEMENTED + tested (conversation history per session; advisory context injection)
+- Retrieval pipeline: integration tests present (backend/tests/test_retrieval_pipeline.py) — plan → execute → fuse flow verified; 46 tests passing
+
+**Source Coverage Note**
+- Unit and integration tests pass end-to-end
+- Multi-symbol comparative answers (SPY/QQQ) depend on actual row presence in SQL tables (prices, etf_holdings)
+- Ingestion path issues fixed; runtime SQL validation for these symbols is next validation step
 
 ---
 
@@ -295,4 +301,4 @@ Context Builder
 - NO source selection override (router determines SQL/vector/hybrid; LLM cannot change it)
 - NO P&L estimation (cost_basis insufficient; LLM forbidden from extrapolating returns)
 - Conversation summary is advisory context only (similar to user profile)
-- LLM must not treat history as authoritative data over retrieved SQL/vector results
+- LLM must not treat history as authoritative data over retrieved SQL/vector results                                                                                                                                                                                                                                                                                                                                                                                                                     

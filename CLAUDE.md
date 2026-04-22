@@ -45,7 +45,8 @@ Full index: [claude/CLAUDE.md](claude/CLAUDE.md)
 |---|---|
 | Retrieval / source selection | system_behavior.md + schema.md |
 | Personalization / user profiles | system_behavior.md |
-| SQL queries / data | project.md + schema.md |
+| SQL queries / data | project.md + schema.md + state.md |
+| Source / data debugging | project.md + system_behavior.md + state.md |
 | Security / rules | engineering_rules.md |
 | Testing | workflow.md |
 | New feature | stack.md + architecture.md + engineering_rules.md |
@@ -81,14 +82,4 @@ Rules:
 - **Vector**: documents, knowledge base, similar queries
 - **Hybrid**: multi-source analysis, cross-reference questions
 
-## User Profile Rules
-
-- Profile is **advisory only**
-- Never override retrieved data with profile
-- Use for context, filtering, and personalization
-
-## Caching Awareness
-
-- Reuse cached results when available
-- Always respect `owner_id` isolation
-- Invalidate on data mutation
+## User Profi
