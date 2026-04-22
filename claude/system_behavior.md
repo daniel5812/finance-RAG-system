@@ -1,272 +1,298 @@
 # System Behavior
 
-## LLM V2 Request Flow
-The active target architecture is a deterministic retrieval pipeline. The system behavior is defined by the following flow:
+## Request Flow
+1. Layered cache lookup (exact → semantic, Redis)
+2. If miss: router.py decomposes query → intent JSON + source selection (SQL / vector / hybrid)
+3. Validate params: normalize → FX direction → validate → build query plan per source
+4. Execute selected source(s): SQL retrieval and/or vector retrieval (parallel when hybrid)
+5. context_fusion layer: merge SQL results + vector chunks + user profile context
+6. Intelligence Layer (7-stage pipeline)
+   - Stage 0: UserProfiler (instant)
+   - Stage 1 (parallel): MarketAnalyzer + AssetProfiler + PortfolioFit
+   - Stage 2: ScoringEngine (deterministic)
+   - Stage 3: Recommendation (deterministic action + LLM reasoning only)
+   - Stage 4: _compute_pipeline_confidence (deterministic)
+   - Stage 5: ValidationAgent (can only downgrade)
+7. build_intelligence_context() → [NORMALIZED PORTFOLIO] + [VALIDATION]
+8. build_user_message (intelligence context + citations + optional conversation summary)
+9. (NEW) conversation context injection:
+   - If session history exists → include summarized context
+   - If no history → proceed stateless
+10. security.py PII filter → OpenAI (synthesis only, no SQL injection) → confidence → cache + return
 
-1. Normalize question
-2. Build plan
-3. Execute retrieval
-4. Assemble context
-5. Call LLM
-6. Validate response
+## Retrieval Layer — Planner → Executor → Fusion
 
-The LLM is the last transformation step before validation. It is not a planner, router, calculator, or fallback engine.
+### Planner (IMPLEMENTED: backend/rag/planner.py + backend/rag/schemas.py)
 
-## System Guarantees
+**Components**
+- IntentParser — query → intent_list (keyword + alias matching, no LLM)
+- ParamExtractor — per intent → validated params or `status: invalid`
+- SourceSelector — params + system_context → `SQL | VECTOR | NO_MATCH` per intent
+- ProfileAnnotator — appends `profile_hint` to steps (advisory only, no param mutation)
+- PlanBuilder — assembles final `QueryPlan` + `plan_meta`
 
-The V2 pipeline enforces these explicit guarantees:
+**Flow**
+1. IntentParser → `intent_list`
+2. ParamExtractor → `[{intent, params, status}]`
+3. SourceSelector → `[{intent, params, source_type}]`
+4. ProfileAnnotator → attach `profile_hint` where relevant
+5. PlanBuilder → `QueryPlan`
 
-1. **Deterministic SQL-First Retrieval:** Every question produces a structured plan. If SQL retrieval is planned, the system executes SQL. If SQL returns empty, NO implicit fallback to vector retrieval occurs. The plan is the contract.
+**Intent Types**
 
-2. **No Silent Hallucination:** The LLM never infers missing data, computes financial values, or chooses alternative data sources. Missing data results in an explicit "no data available" message, never a guessed answer.
+| Type | Source | Params |
+|---|---|---|
+| fx_rate | sql | base, quote (ISO) |
+| price_lookup | sql | ticker (1-5 chars) |
+| macro_series | sql | series_id (FRED ID) |
+| etf_holdings | sql | symbol (1-5 chars) |
+| document_lookup / filing_lookup | vector | ticker? |
+| knowledge_query | vector | — |
+| no_match | vector (owner_id only) | — |
+| hybrid | sql + vector | per-step params |
 
-3. **Explicit Failure Behavior:** Invalid queries (malformed ticker, missing ingestion) return explicit error states. Multi-intent partial failures return available results + explicitly list missing parts. No silent degradation.
-
-4. **Source Transparency:** Every retrieved chunk includes `source_type` (sql or document). The system never mixes sources without explicit plan declaration. Citation accuracy is enforced by design.
-
-5. **Cache Safety by Design:** Plan cache rejects ticker-specific SQL plans for different tickers. Semantic cache includes ticker fingerprint validation + owner_id scoping. Cross-user and cross-ticker contamination is impossible.
-
-6. **Observable Failure Modes:** Every stage fails loudly with explicit error messages, never with partial or degraded results. Heuristics fast-track (< 5ms planning) avoids LLM router when possible for latency predictability.
-
-## Stage Behavior
-
-### 1. Normalize Question
-- Input: raw user question
-- Output: `normalized_question`
-- Responsibilities:
-  - canonicalize the question
-  - extract deterministic entities and aliases
-  - preserve the user's request in a structured form
-- Must not:
-  - choose retrieval source
-  - call SQL or vector tools
-  - add hidden context
-
-### 2. Build Plan
-- Input: `normalized_question`
-- Output: `plan`
-- Responsibilities:
-  - choose retrieval mode from code-defined rules
-  - define query template and parameters
-  - define limits, required fields, and validation constraints
-  - explicitly declare whether vector retrieval is disabled or enabled
-- Must not:
-  - call the LLM
-  - retrieve data
-  - rely on implicit fallback chains
-
-Example plan shape:
-```json
-{
-  "retrieval_mode": "sql",
-  "query_template": "latest_fx_rate",
-  "params": {
-    "base_currency": "USD",
-    "quote_currency": "ILS"
-  },
-  "row_limit": 1,
-  "vector_enabled": false
-}
+**SQL Templates**
+```
+fx_rate:      SELECT rate, date FROM fx_rates WHERE base_currency='{base}' AND quote_currency='{quote}' ORDER BY date DESC LIMIT 1
+price_lookup: SELECT symbol, close, date FROM prices WHERE symbol='{ticker}' ORDER BY date DESC LIMIT 30
+macro_series: SELECT series_id, value, date FROM macro_series WHERE series_id='{series_id}' ORDER BY date DESC LIMIT 12
+etf_holdings: SELECT holding_symbol, weight FROM etf_holdings WHERE etf_symbol='{symbol}' ORDER BY weight DESC LIMIT 20
 ```
 
-### 3. Execute Retrieval
-- Input: `plan`
-- Output: `retrieved_rows`
-- Responsibilities:
-  - run the exact retrieval defined by the plan
-  - return explicit results or explicit failure states
-  - keep retrieval execution observable
-- Must not:
-  - re-plan
-  - expand to other data sources silently
-  - mix SQL and vector unless `plan` says so
-  - silently fall back to vector when SQL returns empty
+**Source Selection Rules**
+- SQL intent + valid params → `SQL`
+- SQL intent + invalid params → `NO_MATCH` → `VECTOR` (owner_id filter only)
+- document / filing / knowledge intent → `VECTOR`
+- No intent detected → `NO_MATCH` → `VECTOR` (owner_id filter only)
+- SQL step + distinct document/contextual intent → `HYBRID`
+- SQL step + another SQL step → two SQL steps, no VECTOR added
 
-Retrieval is SQL-first in v2. Vector retrieval is optional and is not part of the default path. It may be added later only when a deterministic plan explicitly enables it.
+**Hybrid Rules**
+- Add VECTOR step only when SQL cannot provide the needed context (narrative, filing text, knowledge)
+- Never add VECTOR if SQL result fully answers the intent
+- VECTOR step in hybrid must be scoped (doc_type or ticker when detectable)
+- Max 1 VECTOR step per plan; max 3 steps total
 
-**Critical:** If a SQL plan returns no rows, the system returns an explicit empty state. No implicit fallback to vector retrieval occurs.
+**vector_filter**
+```
+vector_filter
+  owner_id    string        — always required
+  doc_type    filing | upload | knowledge | null
+  ticker      string | null — only if explicitly detected; never inferred
+```
+- Avoid global search (owner_id only) when doc_type or ticker is known
 
-### 4. Assemble Context
-- Input: `normalized_question`, `plan`, `retrieved_rows`
-- Output: `assembled_context`
-- Responsibilities:
-  - keep only relevant evidence
-  - enforce minimal, structured context
-  - preserve provenance from retrieval to generation
-- Must not:
-  - inject hidden context
-  - pass large raw retrieval blobs to the LLM
-  - encode business decisions into prompt prose
+**QueryPlan**
+```
+QueryPlan
+  steps[]
+    step_id          int
+    source_type      SQL | VECTOR | NO_MATCH
+    intent_type      string
+    parameters       dict
+    sql_template_id  string | null
+    vector_filter    {owner_id, doc_type?, ticker?} | null
+    priority         int
+    execution_mode   parallel | sequential
+    profile_hint     dict | null
 
-### 5. Call LLM
-- Input: `assembled_context`
-- Output: `answer_draft`
-- Responsibilities:
-  - synthesize provided evidence into clear language
-  - keep reasoning bounded to supplied context
-- Must not:
-  - choose source
-  - compute financial values
-  - infer missing data
-  - override deterministic outputs
+  plan_meta
+    total_steps      int
+    is_hybrid        bool
+    fusion_required  bool
+```
 
-### 6. Validate Response
-- Input: `answer_draft`, `assembled_context`, `plan`
-- Output: `answer`
-- Responsibilities:
-  - check that the answer is supported by context
-  - enforce response structure and guardrails
-  - reject unsupported or non-compliant drafts
-- Must not:
-  - retrieve more data
-  - silently patch missing evidence
-  - bypass failed upstream stages
+**Planner Does NOT Do**
+- Execute queries
+- Generate dynamic SQL
+- Inject owner_id into SQL params
+- Override source selection via LLM
 
-## Multi-Intent Query Support
+**Implementation Status**
+- Schemas: VectorFilter, PlanStep, PlanMeta, HybridQueryPlan (backend/rag/schemas.py)
+- Planner: IMPLEMENTED + tested (backend/rag/planner.py, backend/tests/test_planner.py)
+- Executor: IMPLEMENTED + tested (backend/rag/executor.py, backend/tests/test_executor.py)
+- Fusion: IMPLEMENTED + tested (backend/rag/fusion.py, backend/tests/test_fusion.py)
+- Retrieval pipeline: integration tests present (backend/tests/test_retrieval_pipeline.py) — plan → execute → fuse flow verified
 
-The planner may emit multiple SQL plans in a single request. Example: "What is the Fed rate and USD/ILS exchange rate?" produces:
-- One `macro_series` plan (FEDFUNDS)
-- One `fx_rate` plan (USD/ILS)
+---
 
-Both plans execute concurrently. Results are merged and assembled into a single context block. The LLM synthesizes both retrieved values in a single response. This is deterministic and explicit — the plan declares intent multiplicity upfront.
+### Executor (IMPLEMENTED: backend/rag/executor.py)
 
-## Query Modes: Factual vs Analytical
+**Execution Flow**
+1. Receive `QueryPlan` + `owner_id`
+2. Group steps by `priority` → ordered buckets
+3. Per bucket: `parallel` steps run concurrently; `sequential` steps run one-by-one
+4. Collect `StepResult` per step; continue on failure
+5. Return `list[StepResult]` when all buckets complete
 
-The system operates in two distinct modes based on intent classification. **Intent classification is deterministic and rule-based** (heuristic keyword matching in `chat_service.py`). It is NOT LLM-driven; the LLM does not decide which mode to use.
+**Step Execution**
+- `SQL` → `sql_tool(template_id, parameters, owner_id)` — owner_id injected by executor
+- `VECTOR` → `vector_store.query(vector_filter + owner_id, query_text)` — owner_id always appended
+- `NO_MATCH` → `vector_store.query({owner_id}, query_text)` — no doc_type filter
 
-### Factual Mode (SQL-First)
-Direct data retrieval with minimal synthesis. No intelligence layer.
+**Error Handling**
+- Step timeout → `status: error`, `data: null` — plan continues
+- 0 rows / 0 chunks → `status: empty`, `data: []`
+- Unhandled exception → `status: error`, log step_id + error type
+- All steps error/empty → return full `list[StepResult]`; fusion layer decides
 
-Query types:
-- **price_lookup:** "What is the AAPL stock price?" → retrieves 30 days of price history
-- **fx_rate:** "What is the USD/ILS rate?" → retrieves latest FX rate
-- **macro_series:** "What is the Fed rate?" → retrieves latest macro indicator (FEDFUNDS, CPI, GDP, unemployment)
-- **etf_holdings:** "What are the SPY holdings?" → retrieves ETF composition
+**StepResult**
+```
+StepResult
+  step_id       int
+  source_type   SQL | VECTOR | NO_MATCH
+  intent_type   string
+  data          list | null
+  status        ok | empty | error
+```
 
-Even if the question uses interpretive language ("Explain the trend of AAPL stock price", "Analyze MSFT price movement"), if it contains a price indicator + a named ticker, it remains in **Factual Mode**. The system retrieves the data via SQL and the LLM performs lightweight synthesis only.
+---
 
-### Analytical Mode (Intelligence Layer)
-Deeper reasoning and comparative analysis. May invoke portfolio analysis, risk scoring, and recommendations.
+### Fusion Layer (IMPLEMENTED: backend/rag/fusion.py)
 
-Query types:
-- **portfolio_analysis:** "What is my portfolio risk exposure?" → analyzes user positions against market context
-- **comparative_analysis:** "How do tech stocks compare for diversification?" → comparative reasoning (not a specific ticker price)
-- **advisory:** "Should I buy Apple stock?" → recommendation with reasoning
-- **market_analysis:** "What is the impact of inflation on bonds?" → causal reasoning over market context
+**Inputs**
+- `QueryPlan` — step metadata
+- `list[StepResult]` — executor output
+- `user_profile` (optional) — advisory only
 
-**Key distinction:** If a question asks about a SPECIFIC TICKER's price data without deeper portfolio/market analysis, it is **Factual Mode** regardless of wording.
+**Flow**
+1. Partition: `sql_results` ← SQL steps `ok`; `vector_results` ← VECTOR/NO_MATCH steps `ok`
+2. Collect empty/error steps → generate `missing_data_notes`
+3. Build `structured_data` from sql_results (keyed by intent_type, data untouched)
+4. Build `supporting_context` from vector_results (chunks with source provenance)
+5. Append profile as `advisory_context` in `retrieval_summary`
 
-## Failure Behavior
+**Merge Rules**
+- SQL data → `structured_data` only; never merged into `supporting_context`
+- Vector chunks → `supporting_context` only; never promoted to `structured_data`
+- No value recomputation at any stage
+- Empty/error step → `missing_data_notes` entry with intent_type + source_type + status
+- All steps empty/error → empty structured_data + supporting_context; notes populated
+- Profile → `advisory_context` block only; not injected into data fields
 
-The system returns explicit failure states rather than silent fallbacks or inferred answers.
+**FusionResult**
+```
+FusionResult
+  structured_data      dict[intent_type → data]
+  supporting_context   list[{chunk_text, source_doc, step_id}]
+  missing_data_notes   list[{intent_type, source_type, status}]
+  retrieval_summary    {
+    has_sql:           bool
+    has_vector:        bool
+    is_partial:        bool
+    advisory_context:  dict | null
+  }
+```
 
-### Invalid or Missing Data
-- **Invalid ticker (e.g., "XYZ123"):** System validates format at plan execution time. If validation fails, returns: `"Data not available for ticker XYZ123."`
-- **Ticker with no ingested data (e.g., "NEWCO"):** SQL query returns zero rows. System returns: `"No pricing data available for NEWCO."` Does NOT fall back to vector search.
-- **Missing macro series (e.g., "inflation" without CPIAUCNS ingestion):** SQL query returns empty. System returns: `"No data available for the requested series."` Explicit state, no implicit fallback.
+---
 
-### Multi-Intent Partial Failure
-When multiple plans are executed (e.g., "What is the Fed rate and USD/ILS exchange rate?"):
-- If BOTH plans return data → synthesize full answer with both values
-- If ONE plan returns data and ONE fails → return available data + explicitly state what's missing. Example: `"The Fed rate is 4.50%. Data for USD/ILS exchange rate is not currently available."`
-- If BOTH plans fail → return explicit failure message for both intents
+### No-Match Path
 
-This is deterministic: partial results are returned and marked as such. The system never infers or guesses missing values.
+- no_match → VECTOR step with owner_id filter only (no doc_type)
+- NO fallback chain; NO router retry; NO SQL on no_match; deterministic path
 
-### No Implicit Fallback
-If the plan declares SQL-first retrieval and SQL returns empty:
-- Vector retrieval is NOT triggered
-- No alternative data sources are queried
-- System returns explicit "no data" message
-- User sees a clear failure state, not an irrelevant answer from a different source
+## User Profile Usage
 
-## Caching Safety: Two Distinct Layers
+- UserProfiler (Stage 0) extracts risk_tolerance, experience_level from user record
+- Profile injected as advisory context into ScoringEngine and Recommendation stages
+- Profile is informational only: never overrides retrieved data, SQL results, or deterministic scores
+- Profile absence is non-fatal: pipeline proceeds with reduced personalization context
 
-The system maintains two independent caches with distinct responsibilities and safety constraints:
+## Parameter Normalization
 
-### Layer 1: Plan Cache (Semantic, Matched by Query Similarity)
-**Purpose:** Avoid re-planning semantically identical questions.
+Currency Aliases
+| Input | ISO |
+|---|---|
+| dollar, usd, דולר | USD |
+| shekel, nis, שקל | ILS |
+| euro, eur, אירו | EUR |
+| pound, gbp | GBP |
+| yen, jpy | JPY |
+| franc, chf | CHF |
+| cad | CAD |
+| aud | AUD |
 
-**When used:** 
-- After heuristics returns no plan
-- Before calling the LLM router (slow track)
-- Orchestrator looks up plan by embedding similarity of the normalized question
+FX Direction (set-based, order ignored)
+- USD + ILS → base=USD, quote=ILS (always)
+- USD + X → base=USD, quote=X
+- X only → base=USD, quote=X
+- None → reject → no_match (synthesis)
 
-**Content:** Structured retrieval plans (source mode, query template, parameters, row limits)
+Macro Mapping
+| Input | FRED ID |
+|---|---|
+| inflation, cpi, אינפלציה | CPIAUCNS |
+| interest rate, fed rate, ריבית | FEDFUNDS |
+| gdp, תוצר | GDP |
+| unemployment, unrate, אבטלה | UNRATE |
 
-**Safety constraint:** 
-- **Ticker-specific SQL plans are never reused across different tickers.** A cached plan with `prices WHERE symbol='TSLA'` is rejected if the current question asks about `XYZ123`. This guard is enforced by checking the query string for ticker-specific SQL syntax. Prevents silent cross-ticker data contamination.
+Validation Rules
+| Type | Param | Rule |
+|---|---|---|
+| fx_rate | base, quote | in {USD, ILS, EUR, GBP, JPY, CHF, CAD, AUD} |
+| price_lookup | ticker | ^[A-Z]{1,5}$ |
+| macro_series | series_id | in {CPIAUCNS, FEDFUNDS, GDP, UNRATE} |
+| etf_holdings | symbol | ^[A-Z]{1,5}$ |
 
-### Layer 2: Semantic Answer Cache (Full answers, Matched by Answer Similarity)
-**Purpose:** Avoid re-running retrieval and generation for semantically identical questions.
+Sanitization
+- Strip non-alphanumeric/underscore, uppercase, cap 20 chars
 
-**When used:**
-- After planning completes
-- After retrieval and context assembly complete
-- Before calling LLM (skip generation entirely on hit)
-- Subsequent semantically similar questions hit this cache
+Semantic Rewrite
+- Strip English filler phrases
+- Remove English stop words
+- Hebrew passes through
+- Cap 10 tokens
+- Add context suffix
 
-**Content:** Full answers (synthesis output + sources + citations)
+## Intelligence Layer
 
-**Safety constraints:**
-- **Scoped by `owner_id`** to prevent cross-user cache hits (multi-tenancy)
-- **Ticker fingerprint validation:** Each cached answer is tagged with a "ticker fingerprint" (extracted meaningful tokens from the original question, excluding common words). During lookup, if the current question's tickers don't match the cached entry's tickers, the hit is rejected. Example: `"What is TSLA price?"` answer is never served for `"What is XYZ123 price?"` even though both have ~0.95 cosine similarity.
+Pipeline Stages
+0. UserProfiler (instant, no DB)
+1. (parallel) MarketAnalyzer + AssetProfiler + PortfolioFit
+2. ScoringEngine (deterministic: 0.30*market + 0.25*user + 0.20*diversify + 0.25*risk)
+3. Recommendation (deterministic action + LLM reasoning)
+4. _compute_pipeline_confidence (deterministic)
+5. ValidationAgent (can only downgrade, runs LAST)
 
-## Sources & Provenance
+Agents
+| Agent | Type |
+|---|---|
+| UserProfiler | Pure transform |
+| MarketAnalyzer | DB reads: macro, fx |
+| AssetProfiler | DB reads: prices, etf_holdings |
+| PortfolioFit | DB reads + normalization |
+| ScoringEngine | FULLY DETERMINISTIC (no LLM) |
+| Recommendation | Deterministic action + LLM reasoning |
+| ValidationAgent | 5 sanity checks; downgrades confidence |
 
-Every retrieved chunk includes a `source_type`:
-- `"sql"`: came from a deterministic SQL query
-- `"document"`: came from vector retrieval on uploaded documents
+Data Normalization (data_normalizer.py)
+- Pure function, no DB/LLM
+- normalize_portfolio(rows) → NormalizedPortfolio
+- Deduplicates: newest row wins
+- total_invested = SUM(quantity × cost_basis)
+- allocation_pct = position_value / total_invested * 100
+- data_note: returns/P&L NOT computable (needs live prices)
 
-If a query runs only SQL, only `source_type="sql"` chunks appear in the context. Document sources only appear if the plan explicitly enables vector retrieval. This clarity is essential for citation and trust.
+ValidationAgent Rules
+- Check 1: All scores in [0.0, 1.0]
+- Check 2: Action ↔ composite_score consistency
+- Check 3: confidence=high requires asset_scores + fed_rate
+- Check 4: recommendation.confidence=high requires data_coverage=full
+- Check 5: allocation_pct sum 99–101%
+- Downgrade: len(flags) >= 3 → low; any flags + high → medium
 
-## Explicitly Removed From V2
-The following behaviors are not part of the v2 architecture and should not be reintroduced into core docs or implementation work:
+Context Builder
+- [NORMALIZED PORTFOLIO — pre-computed, DO NOT recalculate]
+- [VALIDATION] with flags + confidence_override
+- Inserted before Portfolio Fit
 
-- implicit fallback logic
-- SQL-to-vector fallback when SQL returns empty
-- mixed SQL + vector retrieval without explicit plan output
-- hidden context injection
-- LLM-led routing or source selection
-- multi-agent intelligence orchestration as the default response path
-- prompt-time decision making that replaces deterministic code paths
-
-## Deterministic Planning Rules
-- Every request must produce a structured `plan`.
-- The plan must be inspectable before retrieval starts.
-- If no valid plan can be built, the system should return an explicit planning failure state.
-- Unplanned retrieval is not allowed.
-- Undocumented fallback chains are not allowed.
-
-## Observability
-Every stage must log:
-- inputs
-- outputs
-- metrics
-
-Required per-query trace:
-- `normalized_question`
-- `plan`
-- `executed_query`
-- `retrieved_rows`
-- `assembled_context`
-- `final_prompt_size`
-- `answer`
-
-Metrics should make it possible to isolate where quality degraded:
-- normalization success or failure
-- planning success or failure
-- retrieval latency and row count
-- context size before and after filtering
-- final prompt size
-- validation pass or failure
-
-## Debugging Priority
-Debugging starts with:
-1. normalization correctness
-2. plan correctness
-3. retrieval correctness
-4. context assembly quality
-5. only then LLM prompt or output behavior
-
-Retrieval first, generation last. If retrieval is wrong, the system fails even if the prompt is strong.
+## LLM Constraints (Synthesis Only)
+- NO parameter generation (router handles all SQL-param extraction)
+- NO portfolio recalculation (data_normalizer output is immutable)
+- NO confidence override (ValidationAgent sets pipeline_confidence deterministically)
+- NO fallback routing (no-match → vector only, never retry SQL)
+- NO source selection override (router determines SQL/vector/hybrid; LLM cannot change it)
+- NO P&L estimation (cost_basis insufficient; LLM forbidden from extrapolating returns)
+- Conversation summary is advisory context only (similar to user profile)
+- LLM must not treat history as authoritative data over retrieved SQL/vector results

@@ -1,43 +1,42 @@
 # Project
 
-System: AI Investment Intelligence Engine with a production-grade backend and an LLM layer being redefined as a deterministic, testable RAG pipeline.
+System: Hybrid Financial RAG Platform — SQL retrieval (structured data) + vector retrieval (documents, filings, knowledge) + external data ingestion + deterministic intelligence layer + user profiling + layered caching. Multi-tenant.
 
 ## Stack
 - Frontend: React + TypeScript + Vite
-- Backend: FastAPI
-- Database: PostgreSQL 16
-- Cache: Redis 7
-- Vector Store: Pinecone
-- LLM: OpenAI via `llm_client.py`
+- Backend: FastAPI (stateless)
+- Database: PostgreSQL 16 (SQL-first retrieval)
+- Cache/Queue: Redis 7
+- Vector Store: Pinecone (document embedding + active retrieval for filings, reports, knowledge base)
+- LLM: OpenAI (synthesis layer via llm_client.py)
 - Auth: Google OAuth2 + JWT
 - Proxy: NGINX
 
 ## Run (Docker)
-```sh
+```
 cd backend && docker-compose up -d --build
 cd frontend && npm install && npm run dev
+GET http://localhost:8000/health
 ```
 
 ## Run (no Docker)
-```sh
-cd backend
-python -m venv venv
+```
+cd backend && python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
+# separate terminal: python worker_entrypoint.py
 ```
 
 ## Env Variables
-Backend: `OPENAI_API_KEY`, `PINECONE_API_KEY`, `FRED_API_KEY`, `GOOGLE_CLIENT_ID`, `JWT_SECRET_KEY`, `DATABASE_URL`, `REDIS_HOST`, `DOCUMENT_UPLOAD_DIR`
-
-Frontend: `VITE_GOOGLE_CLIENT_ID`
+Backend: OPENAI_API_KEY, PINECONE_API_KEY, FRED_API_KEY, GOOGLE_CLIENT_ID, JWT_SECRET_KEY, DATABASE_URL, REDIS_HOST, DOCUMENT_UPLOAD_DIR
+Frontend: VITE_GOOGLE_CLIENT_ID
 
 ## Backend Layers
-- `core/`: connections, cache, llm_client, config, auth, security, prompts
-- `rag/`: planner, sql retrieval, vector retrieval, filtering, context assembly
-- `financial/`: fx, macro, ETF, filings, portfolio providers
-  - **Price Provider:** yfinance (daily OHLCV ingestion into `prices` table)
-  - Note: External dependency; latency varies with market data availability and third-party API responsiveness
-- `documents/`: upload, extract, chunk, embed, upsert
+- core/: connections, cache, llm_client, config, auth, security, prompts
+- rag/: router (planner, source selector), sql_tool, vector_store, context_fusion, chat_service
+- intelligence/: orchestrator, agents (7), data_normalizer, schemas, context_builder
+- financial/: providers (fx, macro, etf, filings, portfolio)
+- documents/: upload, extract, chunk, embed, upsert
 
 ## Database
 
@@ -54,107 +53,86 @@ Frontend: `VITE_GOOGLE_CLIENT_ID`
 | document_chunks | Chunked text | document_id, chunk_text, embedding_id |
 | audit_logs | Admin trail | user_id, action, created_at |
 
-## Data Freshness Contract
+## SQL Whitelist (sql_tool.py, read-only)
+prices, fx_rates, macro_series, filings, etf_holdings, portfolio_positions
 
-**Price Data (`prices` table):**
-- Represents latest available daily market close, ingested via yfinance
-- NOT real-time; NOT intraday updates
-- Daily refresh cadence; exact refresh time varies based on market hours and third-party API responsiveness
-- Stale data gracefully returned if ingestion has not yet occurred for the current day
+## Providers
+- fx.py: Bank of Israel API
+- macro.py: FRED (CPI, GDP, FEDFUNDS, UNRATE)
+- etf.py: Yahoo Finance
+- filings.py: SEC EDGAR
+- portfolio.py: portfolio data aggregation
 
-**FX Data (`fx_rates` table):**
-- Latest available rate for the currency pair
-- Refresh cadence depends on external FX data provider
+## Architecture
 
-**Macro Data (`macro_series` table):**
-- Latest value from FRED (Federal Reserve Economic Data)
-- Official FRED release schedule applies (weekly, monthly, or quarterly depending on series)
+**Retrieval Layer (Hybrid SQL + Vector) — MVP CORE IMPLEMENTED**
+- Planner: IMPLEMENTED (backend/rag/planner.py); determines SQL/VECTOR/HYBRID per intent; tested
+- Executor: IMPLEMENTED (backend/rag/executor.py); runs steps with error resilience; tested
+- Fusion: IMPLEMENTED (backend/rag/fusion.py); merges results into structured_data + supporting_context; tested
+- Retrieval pipeline: plan → execute → fuse flow verified via integration tests
+- Metadata-aware vector retrieval: owner_id always required; doc_type + ticker filters applied when detectable
+- Hybrid orchestration: SQL and vector run in parallel when both needed — not a fallback chain
+- SQL path: structured DB queries (prices, fx, macro, filings, portfolio, etf)
+- Vector path: Pinecone semantic search (uploaded docs, filings, knowledge base)
+- Hybrid path: both executed in parallel → Fusion layer merges results
+- Chat service integration: COMPLETE (backend/rag/services/chat_service.py now uses hybrid pipeline for both sync and streaming responses)
+- Observability: enhanced with stage-level logging, selected_sources, retrieved_sources
 
-## LLM V2 Architecture
+**Ingestion**
+- External providers (FRED, SEC EDGAR, Yahoo Finance, Bank of Israel) → DB + vector store
+- Document upload pipeline → chunked + embedded → Pinecone
 
-### Pipeline
-```text
-User Question
-  -> Question Normalization
-  -> Source Planning
-  -> Retrieval
-  -> Filtering / Scoring
-  -> Context Assembly
-  -> LLM Generation
-  -> Output Validation
-  -> Final Response
-```
+**Intelligence Layer**
+- 7-agent deterministic pipeline (UserProfiler → scoring → ValidationAgent)
+- User profile used as advisory context only; never overrides retrieved data
 
-### Responsibility Boundaries
-- Normalizer
-  - converts raw user input into a canonical question representation
-  - does not retrieve data or choose retrieval mode
-- Planner
-  - chooses retrieval strategy deterministically in code
-  - emits a structured plan with source, template, params, and limits
-  - does not execute queries and does not call the LLM
-- Retriever
-  - executes the plan exactly as defined
-  - does not change source selection or invent fallback behavior
-- Filter / Scorer
-  - reduces retrieval noise with deterministic rules
-  - keeps only the evidence needed downstream
-- Context Assembler
-  - builds a strict, minimal context object for generation
-  - enforces context size and provenance
-- LLM
-  - synthesizes the assembled context into language
-  - does not decide, calculate, or infer beyond supplied evidence
-- Validator
-  - checks that the answer is supported and policy-compliant
-  - blocks unsupported output before return
+**Caching (layered)**
+- Exact cache (Redis): identical query string
+- Semantic cache (Redis): embedding similarity
+- Retrieval cache: materialized SQL result sets
+- Data/provider cache: external API responses with TTL
 
-### Core Design Principles
-- Separation of concerns
-- Deterministic pipeline stages
-- Retrieval first, generation last
-- Minimal context
-- Full observability at every stage
+**LLM Role**
+- Synthesis and reasoning only; no raw data computation, no param generation, no confidence override
 
-### Why V1 Failed
-- Over-coupling
-  - planning, retrieval, reasoning, and output behavior were described as one blended flow
-- Noisy context
-  - too much low-value retrieval context reached the LLM
-- Poor observability
-  - debugging could not cleanly isolate whether failure came from planning, retrieval, or prompt behavior
-- Implicit behavior
-  - fallback chains and hidden context injection made the system hard to reason about
+## Roadmap
 
-### SQL-First Retrieval Policy
-- V2 defaults to SQL-first retrieval
-- Vector retrieval is optional and can only run when explicitly planned
-- SQL and vector should not be combined unless the plan declares that combination
-- **No fallback:** If SQL returns empty, the system does not implicitly fall back to vector. The planner decides upfront whether vector is enabled for this request.
+**Phase 1 — Deterministic Core (COMPLETE)**
+- SQL-first retrieval, deterministic intelligence layer (7 agents), multi-tenant isolation, semantic caching, LLM synthesis only
 
-### Performance & Safety Improvements
-- **Plan Cache Guard:** Ticker-specific SQL plans are not reused across different tickers, preventing silent data contamination.
-- **Semantic Cache Fingerprint:** Cached answers include ticker metadata to prevent "TSLA price" answers from being served for "XYZ123" queries.
-- **Intent Classification Fix:** Price-data queries ("Explain AAPL stock price trend") are marked as factual, not analytical. This avoids invoking the heavy intelligence layer for simple data lookups, improving latency.
-- **Multi-Intent Support:** The planner can emit multiple SQL plans in a single request (e.g., Fed rate + USD/ILS both in one query), merged into a single context block.
+**Phase 2 — Hybrid Retrieval & Source Orchestration (IMPLEMENTED)**
+- Planner: IMPLEMENTED (IntentParser → ParamExtractor → SourceSelector → ProfileAnnotator → PlanBuilder); tested
+- Executor: IMPLEMENTED with error resilience and SQL validation; tested
+- Fusion: IMPLEMENTED with plan-aware summary logic; tested
+- Retrieval pipeline: plan → execute → fuse integrated; integration tests added
+- Metadata-aware vector retrieval (owner_id, doc_type, ticker); hybrid orchestration rules
 
-### Evaluation and Debugging
-Every query must produce a trace with:
-- `normalized_question`
-- `plan`
-- `executed_query`
-- `retrieved_rows`
-- `assembled_context`
-- `final_prompt_size`
-- `answer`
+**Phase 3 — Conversation Memory & Context Awareness**
+- Rolling conversation summary (per session)
+- Inject history summary into prompt construction
+- Enable multi-turn reasoning
+- Foundation for context-aware follow-up questions
+- Priority: establish conversation context before expanding data sources
 
-Debugging starts with retrieval and context assembly. Prompt tuning is not the first response to system failure.
+**Phase 4 — External Data Expansion**
+- Expand macro series coverage
+- Improve filings ingestion and retrieval usage
+- Add additional financial data sources
+- Improve data freshness and coverage breadth
 
-## SQL Whitelist
-Read-only access is limited to:
-- `prices`
-- `fx_rates`
-- `macro_series`
-- `filings`
-- `etf_holdings`
-- `portfolio_positions`
+**Phase 5 — User Profiling & Personalization**
+- User profile store (risk tolerance, experience, preferences)
+- Profile injected as advisory context into intelligence layer
+- Profile never overrides retrieved data or deterministic scores
+
+**Phase 6 — Layered Caching & Evaluation**
+- Exact, semantic, embedding, retrieval, and data/provider cache layers
+- owner_id in all cache keys; TTL discipline per layer
+- Evaluation suite: unit (agents, normalizer), integration (full hybrid pipeline), E2E (Playwright)
+
+**Phase 7 — DevOps & Production Readiness**
+- CI/CD: lint (black, ruff), test (pytest, playwright), build, deploy (staging/prod)
+- Docker hardening (non-root, minimal base images)
+- Secrets management (vault rotation)
+- Monitoring: Prometheus metrics + structured JSON logging
+- Security: rate limiting, RBAC enforcement, audit logging

@@ -201,3 +201,26 @@ Maximum 4 words.
 User Message: {message}
 
 Title:"""
+
+
+def build_conversation_context(summary: str | None) -> str:
+    """
+    Build advisory conversation context block for LLM injection.
+
+    Used to remind LLM of prior conversation topics without repeating full history.
+    Summary must be treated as advisory only — retrieved SQL/vector data takes precedence.
+
+    Args:
+        summary: Brief (~200 token) summary of prior conversation, or None
+
+    Returns:
+        Formatted advisory block (or empty string if no summary)
+    """
+    if not summary:
+        return ""
+
+    return (
+        "[CONVERSATION CONTEXT — ADVISORY ONLY]\n"
+        "This context is not authoritative. Retrieved SQL/vector data takes precedence.\n"
+        f"{summary}"
+    )

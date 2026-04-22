@@ -1,13 +1,13 @@
 """
-price.py — Price data provider (yfinance).
+price.py — Price data provider (Stooq CSV).
 
-yfinance provides free historical daily OHLCV data for US and international stocks.
-No API key or authentication required.
+Stooq provides free historical daily OHLCV data as CSV downloads.
+URL pattern: https://stooq.com/q/d/l/?s={symbol}&d1={start}&d2={end}&i=d
 
 Design notes:
   - Primary source for daily price data
-  - Fetched via yfinance library (HTTP under the hood)
-  - DataFrame converted to CSV, normalized into the `prices` table schema
+  - Fetched via HTTP (no API key needed)
+  - CSV parsed and normalized into the `prices` table schema
   - Incremental: checks last stored date and only fetches new data
 """
 
@@ -15,7 +15,8 @@ import csv
 import io
 from datetime import date, timedelta
 
-import yfinance as yf
+import httpx
+import asyncpg
 import asyncpg
 
 from core.logger import get_logger
@@ -25,11 +26,14 @@ from financial.models import PriceRow
 
 logger = get_logger(__name__)
 
+# Stooq expects dates as YYYYMMDD
+_fmt = "%Y%m%d"
+
 
 class StooqProvider(BaseProvider):
-    """Fetches daily OHLCV data from yfinance."""
+    """Fetches daily OHLCV data from Stooq (CSV)."""
 
-    provider_name = "yfinance"
+    provider_name = "stooq"
 
     def __init__(self, symbol: str, start: date | None = None, end: date | None = None):
         self.symbol = symbol.upper()
@@ -37,48 +41,26 @@ class StooqProvider(BaseProvider):
         self.end = end or date.today()
 
     async def fetch_raw(self, **kwargs) -> str:
-        """Download historical price data from yfinance. Returns raw CSV string."""
-        logger.info(f"[DEBUG] Fetching {self.symbol} from {self.start} to {self.end} via yfinance")
+        """Download CSV from Stooq. Returns raw CSV string."""
+        url = (
+            f"https://stooq.com/q/d/l/"
+            f"?s={self.symbol}&d1={self.start.strftime(_fmt)}"
+            f"&d2={self.end.strftime(_fmt)}&i=d"
+        )
 
-        try:
-            ticker = yf.Ticker(self.symbol)
-            df = ticker.history(start=self.start, end=self.end)
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
 
-            if df.empty:
-                logger.warning(f"[DEBUG] yfinance returned empty data for {self.symbol}")
-                return "Date,Open,High,Low,Close,Volume\n"
-
-            # Reset index to make date a column
-            df = df.reset_index()
-
-            # Select columns in the order normalize() expects
-            df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-
-            # Convert to CSV string
-            csv_string = df.to_csv(index=False)
-
-            logger.info(f"[DEBUG] yfinance response length: {len(csv_string)}, first 300 chars: {csv_string[:300]}")
-
-            return csv_string
-        except Exception as e:
-            logger.error(f"[DEBUG] yfinance fetch failed for {self.symbol}: {e}")
-            raise
+        return resp.text
 
     def normalize(self, raw_data: str) -> list[dict]:
         """Parse CSV into validated PriceRow dicts."""
-        # DEBUG: Log raw response to diagnose empty CSV issue
-        logger.info(f"[DEBUG] Raw response length: {len(raw_data)}, first 200 chars: {raw_data[:200]}")
-
         reader = csv.DictReader(io.StringIO(raw_data))
         rows = []
         skipped = 0
 
-        # DEBUG: Capture fieldnames to verify CSV structure
-        logger.info(f"[DEBUG] CSV fieldnames: {reader.fieldnames}")
-
-        row_count = 0
         for line in reader:
-            row_count += 1
             try:
                 row = PriceRow(
                     symbol=self.symbol,
@@ -94,13 +76,10 @@ class StooqProvider(BaseProvider):
                 rows.append(row.model_dump())
             except Exception as e:
                 skipped += 1
-                logger.warning(f"Skipped row {row_count}: {e}")
-
-        # DEBUG: Log totals
-        logger.info(f"[DEBUG] yfinance {self.symbol}: total_lines={row_count}, parsed={len(rows)}, skipped={skipped}")
+                logger.warning(f"Skipped row: {e}")
 
         if skipped:
-            logger.info(f"yfinance {self.symbol}: parsed {len(rows)}, skipped {skipped}")
+            logger.info(f"Stooq {self.symbol}: parsed {len(rows)}, skipped {skipped}")
 
         return rows
 
@@ -112,7 +91,7 @@ class StooqProvider(BaseProvider):
         """Check the latest date we have for this symbol (for incremental updates)."""
         return await get_last_price_date(self.symbol, self.provider_name)
 
-    async def ingest_incremental(self, pool: asyncpg.Pool) -> dict:
+    async def ingest_incremental(self) -> dict:
         """Only fetch data newer than what we already have."""
         last = await self.get_last_date()
         if last:
@@ -124,7 +103,7 @@ class StooqProvider(BaseProvider):
                     "status": "up_to_date",
                     "rows_ingested": 0,
                 }
-        return await self.ingest(pool)
+        return await self.ingest()
 
 
 # ── Helpers ──

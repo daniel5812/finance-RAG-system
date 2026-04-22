@@ -139,7 +139,7 @@ class FREDProvider(BaseProvider):
 
         return rows
 
-    async def store(self, rows: list[dict]) -> int:
+    async def store(self, pool: asyncpg.Pool, rows: list[dict]) -> int:
         """
         Upsert macro rows to the database (skip duplicates).
 
@@ -149,7 +149,7 @@ class FREDProvider(BaseProvider):
         - This makes the entire pipeline idempotent — you can run
           it 10 times and get the same result.
         """
-        return await upsert_macro_series(rows)
+        return await upsert_macro_series(pool, rows)
 
     async def get_last_date(self) -> date | None:
         """

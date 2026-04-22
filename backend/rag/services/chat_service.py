@@ -2,6 +2,7 @@ import re
 import time
 import json
 import asyncio
+import traceback
 from typing import AsyncGenerator
 from fastapi import HTTPException
 
@@ -18,7 +19,8 @@ from core.state import LLM_SEMAPHORE
 from documents.routing import route_and_search
 from sentence_transformers import SentenceTransformer
 from rag.schemas import ChatQuery
-from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT
+from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
+from core.session_memory import SessionMemoryStore, SummaryBuilder
 import asyncpg
 from uuid import UUID
 from core.dependencies import get_pinecone
@@ -29,6 +31,9 @@ from typing import Any
 from rag.orchestrator import QueryOrchestrator
 from rag.sql_tool import run_sql_query
 from rag.router import _rewrite_for_semantic_search
+from rag.planner import build_plan as _hybrid_build_plan
+from rag.executor import execute_plan as _hybrid_execute_plan
+from rag.fusion import fuse as _hybrid_fuse
 from financial.services.user_profile_service import UserProfileService
 from intelligence.orchestrator import IntelligenceOrchestrator
 from intelligence.context_builder import build_intelligence_context
@@ -140,61 +145,31 @@ async def summarize_history(history: list) -> str | None:
         logger.warning(f"History summarization failed: {e}")
         return None
 
-async def load_session_summary(pool: asyncpg.Pool, session_id: str, owner_id: str) -> str | None:
-    """Load the stored rolling summary for a session, scoped by owner_id."""
-    if not pool or not session_id or not owner_id:
-        return None
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT conversation_summary FROM chat_sessions WHERE id = $1 AND user_id = $2",
-                UUID(session_id), owner_id
-            )
-            return row["conversation_summary"] if row else None
-    except Exception as e:
-        logger.warning(f"Failed to load session summary: {e}")
-        return None
-
-
-async def store_session_summary(pool: asyncpg.Pool, session_id: str, owner_id: str, summary: str) -> None:
-    """Persist the rolling conversation summary, scoped by owner_id to prevent cross-tenant writes."""
-    if not pool or not session_id or not owner_id:
-        return
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE chat_sessions SET conversation_summary = $1, updated_at = NOW() "
-                "WHERE id = $2 AND user_id = $3",
-                summary, UUID(session_id), owner_id
-            )
-        logger.info(json.dumps({"event": "session_summary_stored", "session_id": session_id}))
-    except Exception as e:
-        logger.warning(f"Failed to store session summary: {e}")
-
-
-async def get_memory(pool: asyncpg.Pool, session_id: str | None, owner_id: str | None, history: list) -> str | None:
+async def get_memory(pool: asyncpg.Pool | None, session_id: str | None, owner_id: str | None, history: list) -> str | None:
     """
-    Return a conversation summary to inject into the prompt.
-    - Loads stored summary from DB (scoped by owner_id) to avoid re-summarizing every request.
-    - Re-summarizes (and persists) only when history crosses a new interval boundary.
+    Return a conversation summary from Redis, built from history.
+
+    Behavior:
+    - Always try to load stored summary from Redis (regardless of message count)
+    - If not found, build new summary only if history >= 3 messages
+    - Uses Redis (not DB) for fast access, scoped by owner_id + session_id
+    - Builds summary from pure function (no LLM calls)
     """
-    msg_count = len(history)
-    if msg_count < MEMORY_SUMMARY_THRESHOLD:
-        return None
-
-    # At an interval boundary, always re-summarize (keep memory fresh as conversation grows)
-    at_boundary = (msg_count - MEMORY_SUMMARY_THRESHOLD) % MEMORY_SUMMARY_INTERVAL == 0
-
-    # Try to use stored summary first — avoids an LLM call on most requests
-    if session_id and owner_id and not at_boundary:
-        stored = await load_session_summary(pool, session_id, owner_id)
+    # Always try to use stored summary from Redis first (don't gate on message count)
+    if session_id and owner_id:
+        stored = await SessionMemoryStore.get(owner_id, session_id)
         if stored:
             return stored
 
-    # No stored summary yet, or we've hit the refresh boundary
-    summary = await summarize_history(history)
+    # Only build new summary if history is long enough (SummaryBuilder minimum)
+    msg_count = len(history)
+    if msg_count < 3:  # SummaryBuilder.build returns None for < 3 messages
+        return None
+
+    # Build new summary from history (pure function, no LLM call)
+    summary = SummaryBuilder.build(history)
     if summary and session_id and owner_id:
-        asyncio.create_task(store_session_summary(pool, session_id, owner_id, summary))
+        await SessionMemoryStore.set(owner_id, session_id, summary)  # Wait for write to complete
     return summary
 
 
@@ -245,68 +220,12 @@ async def save_message_to_db(pool: asyncpg.Pool, session_id: str, role: str, con
         except Exception as e:
             logger.error(f"Failed to update session title: {e}")
 
-# Regex for a likely stock ticker embedded in a question (2–5 uppercase letters,
-# not a currency code or FRED series ID).  Used to detect "price data" queries.
-_PRICE_TICKER_RE = re.compile(r'\b[A-Z]{2,5}\b')
-_PRICE_QUERY_NONTICKER = frozenset({
-    # Currency ISO codes
-    "USD", "ILS", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD",
-    # Macro / financial abbreviations that are NOT tickers
-    "CPI", "GDP", "FED", "ETF", "NYSE", "AMEX",
-    # Common 2-letter English words (all caps from question.upper())
-    "IS", "IT", "OF", "IN", "AT", "TO", "BY", "AS", "OR", "AN",
-    "IF", "ON", "DO", "BE", "GO", "MY", "VS",
-    # Common 3-letter English words
-    "THE", "AND", "FOR", "NOT", "YOU", "ALL", "CAN", "WAS", "ONE",
-    "NEW", "NOW", "SEE", "WHO", "DID", "LET", "PUT", "SAY", "SHE",
-    "TOO", "USE", "WAY", "ITS", "BUT", "HAS", "HAD", "ARE", "HOW",
-    "WHY", "HIM", "HIS", "HER", "OUR", "GET",
-    # Common 4-letter English words
-    "WHAT", "THAT", "THIS", "WHEN", "WITH", "WILL", "JUST", "FROM",
-    "HAVE", "BEEN", "WERE", "THEY", "THEM", "THAN", "THEN", "SOME",
-    "MORE", "ALSO", "INTO", "OVER", "SUCH", "MUCH", "VERY", "DOES",
-    "MAKE", "TAKE", "COME", "TELL", "SHOW", "GIVE", "LAST", "WEEK",
-    "YEAR", "HIGH", "HOLD", "SELL", "FUND", "BOND", "RISK", "GAIN",
-    "LOSS", "COST", "OPEN", "DROP", "JUMP", "MOVE", "DATA",
-    # Common 5-letter English / financial domain words
-    "STOCK", "PRICE", "TRADE", "CLOSE", "TREND", "CHART", "ABOUT",
-    "AFTER", "COULD", "WOULD", "THEIR", "WHICH", "THESE", "THOSE",
-    "GIVEN", "SHARE", "INDEX", "ASSET",
-})
-_PRICE_QUERY_INDICATORS = ("price", "stock price", "trading at", "close", "chart")
-
-
-def _is_price_data_query(question: str) -> bool:
-    """
-    Return True when the question is fundamentally asking for specific price
-    data for a named ticker (e.g. "Explain the trend of AAPL stock price").
-
-    Such queries should stay in 'factual' mode even if they contain words like
-    'explain' or 'trend' that would otherwise trigger the full intelligence layer.
-    They are answered by a SQL price_lookup + lightweight synthesis — not by the
-    heavy advisory/portfolio pipeline.
-
-    Criteria: question contains a price indicator AND at least one ticker-like
-    token that is NOT a currency code or known non-ticker abbreviation.
-    """
-    q_lower = question.lower()
-    if not any(ind in q_lower for ind in _PRICE_QUERY_INDICATORS):
-        return False
-    tokens = _PRICE_TICKER_RE.findall(question.upper())
-    return any(t not in _PRICE_QUERY_NONTICKER for t in tokens)
-
-
 def classify_intent(question: str) -> str:
     """Rule-based intent classification. Returns: factual / analytical / advisory."""
     q = question.lower()
     if any(kw in q for kw in ADVISORY_KEYWORDS):
         return "advisory"
     if any(kw in q for kw in ANALYTICAL_KEYWORDS):
-        # Pure price-data queries ("Explain the trend of AAPL stock price") must NOT
-        # trigger the heavy advisory/intelligence pipeline just because they contain
-        # 'explain' or 'trend'.  They are factual SQL lookups with light synthesis.
-        if _is_price_data_query(question):
-            return "factual"
         return "analytical"
     return "factual"
 
@@ -345,6 +264,7 @@ def build_user_message(
     intent: str,
     portfolio_ctx: str | None,
     intelligence_block: str = "",
+    conversation_context: str = "",
 ) -> str:
     """Assemble the final user message with context, intelligence layer, and portfolio data."""
     parts = []
@@ -352,6 +272,10 @@ def build_user_message(
     # Intelligence block goes FIRST — the LLM must read it before any other context
     if intelligence_block:
         parts.append(intelligence_block)
+
+    # Conversation context (from prior turns) — advisory only
+    if conversation_context:
+        parts.append(conversation_context)
 
     if context_block:
         parts.append(
@@ -440,6 +364,105 @@ def _format_sql_rows_as_text(rows: list[dict], max_rows: int = 3) -> str:
 
     return "\n".join(lines)
 
+# ── Hybrid Retrieval Helpers ─────────────────────────────────────────────────
+
+_SQL_LABEL_MAP = {
+    "fx_rate":      "FX Rates",
+    "macro_series": "Macro Indicators",
+    "price_lookup": "Market Prices",
+    "etf_holdings": "ETF Holdings",
+}
+
+# Template SQL strings — params are planner-resolved (not raw user input)
+_SQL_TEMPLATES = {
+    # Fix A: use real fx_rates schema columns (base_currency, quote_currency, date)
+    "fx_rate_latest":    "SELECT base_currency, quote_currency, rate, date FROM fx_rates WHERE base_currency='{base}' AND quote_currency='{quote}' ORDER BY date DESC LIMIT 1",
+    "macro_series_12":   "SELECT series_id, value, date FROM macro_series WHERE series_id='{series_id}' ORDER BY date DESC LIMIT 12",
+    "price_lookup_30d":  "SELECT symbol, date, close FROM prices WHERE symbol='{ticker}' ORDER BY date DESC LIMIT 30",
+    # Fix B: etf_holdings planner resolves to {"symbol": ...}, not {"ticker": ...}
+    "etf_holdings_top20":"SELECT etf_symbol, holding_symbol, weight FROM etf_holdings WHERE etf_symbol='{symbol}' ORDER BY weight DESC LIMIT 20",
+}
+
+
+def _make_sql_runner(pool):
+    """Return async sql_runner(template_id, params) → list[dict] for the Executor."""
+    async def _runner(template_id: str, params: dict) -> list[dict]:
+        template = _SQL_TEMPLATES.get(template_id)
+        if not template or not pool:
+            return []
+        # Fix C: surface SQL failures as raised exceptions so Executor records status="error"
+        sql = template.format(**{k: str(v) for k, v in params.items()})
+        result = await run_sql_query(pool, sql)
+        if result and isinstance(result[0], dict) and "error" in result[0]:
+            raise RuntimeError(result[0]["error"])
+        return result
+    return _runner
+
+
+def _make_vector_runner(query_text: str, pool, pinecone_index, embed_model, rerank_model, query: "ChatQuery", loop):
+    """Return async vector_runner(VectorFilter) → list[dict] for the Executor."""
+    async def _runner(vf) -> list[dict]:
+        try:
+            q_vec = await cached_embed(query_text, loop)
+            if query.owner_id:
+                route_result = await route_and_search(
+                    pool=pool, embed_model=embed_model, pinecone_index=pinecone_index,
+                    rerank_model=rerank_model, question=query_text, user_id=vf.owner_id,
+                    top_k=DYNAMIC_TOP_K, document_ids=query.document_ids,
+                )
+                chunks = route_result["chunks"]
+            else:
+                filter_metadata = {"doc_type": vf.doc_type} if vf.doc_type else None
+                matches = await vector_store.search(
+                    pinecone_index, q_vec, query.user_role, top_k=5,
+                    filter_metadata=filter_metadata,
+                )
+                chunks = dynamic_filter(matches)
+            if chunks:
+                from rag.reranker import rerank_chunks
+                chunks = await rerank_chunks(rerank_model, query_text, chunks, top_n=5)
+            return chunks
+        except Exception as e:
+            logger.warning(f"hybrid vector_runner failed: {e}")
+            return []
+    return _runner
+
+
+def _fusion_to_context(fusion_result) -> tuple:
+    """Convert FusionResult → (contexts, sources, citations, metrics) for downstream use."""
+    contexts, sources, citations = [], [], {}
+    metrics = {"sql": 0.0, "embed": 0.0, "retrieval": 0.0, "rerank": 0.0, "routing": 0.0}
+
+    for intent_type, rows in (fusion_result.structured_data or {}).items():
+        label = _SQL_LABEL_MAP.get(intent_type, "Financial Data")
+        sql_text = f"{label} Result:\n{_format_sql_rows_as_text(rows)}"
+        tag = f"[S{len(contexts)+1}]"
+        contexts.append(f"Source {tag}: {sql_text}")
+        citations[tag] = {"source_type": "sql", "id": "sql_query",
+                          "display_name": f"Source: {label} Table", "context": sql_text}
+        sources.append({"document_id": "sql_query", "chunk_text": sql_text,
+                        "vector_score": 1.0, "rerank_score": 1.0})
+
+    for chunk in (fusion_result.supporting_context or []):
+        if not isinstance(chunk, dict):
+            continue
+        meta = chunk.get("metadata", {}) or {}
+        text = meta.get("text") or chunk.get("text", "")
+        if not text:
+            continue
+        doc_id = meta.get("document_id", "unknown")
+        filename = meta.get("filename")
+        tag = f"[D{len(contexts)+1}]"
+        contexts.append(f"Source {tag}: {text}")
+        citations[tag] = {"source_type": "document", "id": doc_id,
+                          "display_name": filename or "Document", "context": text}
+        sources.append({"document_id": doc_id, "filename": filename, "chunk_text": text,
+                        "vector_score": round(chunk.get("score", 0.0), 4),
+                        "rerank_score": round(chunk.get("rerank_score", 0.0), 4)})
+
+    return contexts, sources, citations, metrics
+
+
 async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, plan, query: ChatQuery, loop, user_role: str):
     sql_time = 0.0
     embed_time = 0.0
@@ -451,18 +474,14 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
     sources = []
     
     citation_mapping = {}
-
-    # Track original routing decision so the vector block cannot run
-    # as an implicit fallback from a SQL plan.
-    original_source = plan.source
-
+    
     if plan.source == "sql":
         t_sql = time.time()
         logger.info(f"executing_sql: {plan.query}")
         result = await run_sql_query(pool, plan.query)
         sql_time = time.time() - t_sql
 
-        # V2: SQL-first determinism — no implicit fallback
+        # Explicit fallback if SQL returns no data or error
         if result and "error" not in result[0]:
             logger.info(f"sql_results: {len(result)} rows")
 
@@ -486,28 +505,33 @@ async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, pla
             }
             sources.append({
                 "document_id": "sql_query",
-                "source_type": "sql",
                 "chunk_text": sql_text,
                 "vector_score": 1.0,
                 "rerank_score": 1.0
             })
         else:
-            # V2 GUARANTEE: SQL returns empty → explicit "no data" state
-            # NO implicit fallback to vector. The validation/synthesis layer
-            # will generate explicit "data not available" message.
-            reason = "sql_no_results" if not result else "sql_error"
+            # ─ Fallback: SQL failed, switching to vector ─
             logger.info(json.dumps({
-                "event": "sql_no_results",
-                "query": plan.query,
-                "reason": reason,
+                "event": "fallback_triggered",
+                "fallback_stage": "sql_to_vector",
+                "reason": "sql_no_results" if not result else "sql_error",
                 "original_intent": getattr(plan, "intent", None),
             }))
-            # Return empty contexts — LLM will synthesize explicit error message
-            contexts = []
-            sources = []
-            citation_mapping = {}
+            plan.source = "vector"
+            # Infer context hint from the failed SQL query to guide semantic rewriting
+            context_hint = "document_analysis"  # default
+            if "fx_rates" in plan.query.lower():
+                context_hint = "fx_rate"
+            elif "prices" in plan.query.lower():
+                context_hint = "price_lookup"
+            elif "macro_series" in plan.query.lower():
+                context_hint = "macro_series"
+            elif "etf_holdings" in plan.query.lower():
+                context_hint = "etf_holdings"
+            # Rewrite question for semantic search: removes fillers, stop words, adds context suffix
+            plan.query = _rewrite_for_semantic_search(query.question, context_hint)
 
-    if plan.source == "vector" and original_source == "vector":
+    if plan.source == "vector":
         t_emb = time.time()
         query_vector = await cached_embed(plan.query, loop)
         embed_time = time.time() - t_emb
@@ -671,7 +695,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     # 🔹 0. CONDENSE QUESTION (only on cache miss)
     # Load stored summary early so condense_question can resolve references from older turns
-    condensation_summary = await load_session_summary(pool, query.session_id, query.owner_id) if query.session_id and query.owner_id else None
+    condensation_summary = await SessionMemoryStore.get(query.owner_id, query.session_id) if query.session_id and query.owner_id else None
     standalone_question = await condense_question(query.history, query.question, summary=condensation_summary)
     logger.info(f"standalone_question: {standalone_question}")
 
@@ -682,7 +706,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     query_vector = await cached_embed(query.question, loop)
     
     # 🔹 1.5 SEMANTIC CACHE LOOKUP
-    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id, question=query.question)
+    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id)
     if sem_result is not None:
         logger.info(json.dumps({"event": "semantic_cache_hit"}))
         obs.emit(PipelineStage.CACHE, "semantic_cache_hit",
@@ -695,28 +719,29 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             asyncio.create_task(save_message_to_db(pool, query.session_id, "assistant", sem_result["answer"], sem_result.get("citations"), {}))
         return sem_result
 
-    # 🔹 2. QUERY PLANNING (Stage 11: Orchestrated)
+    # 🔹 2. HYBRID RETRIEVAL PLANNING
     t_plan = time.time()
-    multi_plan = await QueryOrchestrator.get_plan(query.question, query_vector, query.user_role, owner_id=query.owner_id)
+    hybrid_plan = _hybrid_build_plan(standalone_question, query.owner_id or "")
     plan_time = time.time() - t_plan
     obs.emit(
         PipelineStage.ROUTER, "router_plan_built",
-        summary=f"{len(multi_plan.plans)} plan(s): {', '.join(p.source + '(' + (p.intent or '') + ')' for p in multi_plan.plans)}",
+        summary=f"{hybrid_plan.plan_meta.total_steps} step(s) — hybrid={hybrid_plan.plan_meta.is_hybrid}",
         latency_ms=plan_time * 1000,
-        data={"plan_count": len(multi_plan.plans),
-              "plans": [{"source": p.source, "intent": getattr(p, "intent", None)} for p in multi_plan.plans]},
+        data={"step_count": hybrid_plan.plan_meta.total_steps,
+              "is_hybrid": hybrid_plan.plan_meta.is_hybrid},
     )
 
-    # 🔹 3. CONCURRENT RETRIEVAL (Stage 9)
+    # 🔹 3. HYBRID RETRIEVAL EXECUTION + FUSION
     t_ret_start = time.time()
-    tasks = [
-        execute_sub_query(pool, pinecone_index, embed_model, rerank_model, p, query, loop, query.user_role)
-        for p in multi_plan.plans
-    ]
-    sub_results = await asyncio.gather(*tasks)
+    _step_results = await _hybrid_execute_plan(
+        hybrid_plan, query.owner_id or "",
+        sql_runner=_make_sql_runner(pool),
+        vector_runner=_make_vector_runner(standalone_question, pool, pinecone_index, embed_model, rerank_model, query, loop),
+    )
+    fusion_result = _hybrid_fuse(hybrid_plan, _step_results)
     retrieval_time = time.time() - t_ret_start
 
-    relevant_contexts, sources, metrics, citations = merge_contexts(sub_results)
+    relevant_contexts, sources, citations, metrics = _fusion_to_context(fusion_result)
 
     # ─ After Context Assembly: High-signal routing & context metadata ─
     has_sql_context = any(s.get("source_type") == "sql" for s in sources)
@@ -731,8 +756,8 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
         "event": "context_assembly_complete",
         "request_id": getattr(query, "request_id", None),
         "owner_id_exists": bool(query.owner_id),
-        "intent": intent,
-        "route_count": len(multi_plan.plans),
+        "plan_steps": hybrid_plan.plan_meta.total_steps,
+        "is_hybrid": hybrid_plan.plan_meta.is_hybrid,
         "has_sql_context": has_sql_context,
         "has_vector_context": has_vector_context,
         "sql_row_count": sql_row_count,
@@ -742,7 +767,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     obs.emit(
         PipelineStage.VECTOR_RETRIEVAL, "retrieval_complete",
-        summary=f"Retrieved {len(relevant_contexts)} context chunk(s) from {len(multi_plan.plans)} plan(s)",
+        summary=f"Retrieved {len(relevant_contexts)} context chunk(s) from {hybrid_plan.plan_meta.total_steps} plan step(s)",
         latency_ms=retrieval_time * 1000,
         data={
             "context_count": len(relevant_contexts),
@@ -774,19 +799,6 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     # 🔹 5.5 INVESTMENT INTELLIGENCE LAYER
     # Runs between retrieval and LLM synthesis. Failure is isolated — never crashes the pipeline.
-    # Determine if Intelligence Layer is needed based on explicit signals, not just intent.
-    # Intelligence Layer is needed only when intent explicitly signals advisory/analytical reasoning.
-    # Portfolio context is injected into the prompt separately via portfolio_ctx and does NOT
-    # alone justify running heavy agents on factual price/FX/macro/ETF queries.
-    requires_intelligence = intent in ("advisory", "analytical", "simulation")
-
-    logger.info(json.dumps({
-        "event": "intelligence_requirement_check",
-        "intent": intent,
-        "has_portfolio": portfolio_ctx is not None,
-        "requires_intelligence": requires_intelligence,
-    }))
-
     intelligence_block = ""
     pipeline_confidence: str | None = None   # deterministic — overrides LLM self-reported confidence
     _intelligence_report = None
@@ -794,98 +806,92 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     _confidence_before_validation: str | None = None
     _downgrade_happened: bool = False
     t_intel = time.time()
+    try:
+        intelligence_report = await IntelligenceOrchestrator.run(
+            question=standalone_question,
+            intent=intent,
+            raw_profile=user_profile,   # may be None — orchestrator handles gracefully
+            owner_id=query.owner_id,
+            pool=pool,
+        )
+        _intelligence_report = intelligence_report
+        _confidence_before_validation = intelligence_report.pipeline_confidence
+        pipeline_confidence = intelligence_report.pipeline_confidence
+        intelligence_block = build_intelligence_context(intelligence_report)
+        _val_flags = (
+            intelligence_report.validation_result.flags
+            if intelligence_report.validation_result else []
+        )
+        _val_flags_count = len(_val_flags)
 
-    if requires_intelligence:
-        try:
-            intelligence_report = await IntelligenceOrchestrator.run(
-                question=standalone_question,
-                intent=intent,
-                raw_profile=user_profile,   # may be None — orchestrator handles gracefully
-                owner_id=query.owner_id,
-                pool=pool,
-            )
-            _intelligence_report = intelligence_report
-            _confidence_before_validation = intelligence_report.pipeline_confidence
-            pipeline_confidence = intelligence_report.pipeline_confidence
-            intelligence_block = build_intelligence_context(intelligence_report)
-            _val_flags = (
-                intelligence_report.validation_result.flags
-                if intelligence_report.validation_result else []
-            )
-            _val_flags_count = len(_val_flags)
+        # Detect if validation downgraded confidence
+        if intelligence_report.validation_result and intelligence_report.validation_result.confidence_override:
+            if intelligence_report.validation_result.confidence_override != _confidence_before_validation:
+                _downgrade_happened = True
+                pipeline_confidence = intelligence_report.validation_result.confidence_override
 
-            # Detect if validation downgraded confidence
-            if intelligence_report.validation_result and intelligence_report.validation_result.confidence_override:
-                if intelligence_report.validation_result.confidence_override != _confidence_before_validation:
-                    _downgrade_happened = True
-                    pipeline_confidence = intelligence_report.validation_result.confidence_override
+        _system_action = (
+            intelligence_report.recommendation.action
+            if getattr(intelligence_report, "recommendation", None) else None
+        )
 
-            _system_action = (
-                intelligence_report.recommendation.action
-                if getattr(intelligence_report, "recommendation", None) else None
-            )
-
-            # ─ After Intelligence Pipeline: Confidence tracking & validation state ─
-            logger.info(json.dumps({
-                "event": "intelligence_pipeline_complete",
-                "selected_action": str(_system_action) if _system_action else None,
-                "confidence_before_validation": _confidence_before_validation,
-                "final_confidence": pipeline_confidence,
-                "downgrade_happened": _downgrade_happened,
-                "validation_flags_count": _val_flags_count,
-                "agents_ran": intelligence_report.agents_ran,
-                "has_recommendations": intelligence_report.has_recommendations,
-            }))
-
-            logger.info(json.dumps({
-                "event": "intelligence_layer_complete",
-                "agents_ran": intelligence_report.agents_ran,
-                "confidence": pipeline_confidence,
-                "has_recommendations": intelligence_report.has_recommendations,
-                "validation_passed": (
-                    intelligence_report.validation_result.passed
-                    if intelligence_report.validation_result else None
-                ),
-            }))
-            obs.emit(
-                PipelineStage.VALIDATION, "intelligence_layer_complete",
-                summary=f"Intelligence pipeline done — confidence={pipeline_confidence}, action={_system_action}",
-                latency_ms=(time.time() - t_intel) * 1000,
-                data={
-                    "agents_ran":          intelligence_report.agents_ran,
-                    "confidence":          pipeline_confidence,
-                    "system_action":       _system_action,
-                    "has_recommendations": intelligence_report.has_recommendations,
-                    "validation_passed":   (intelligence_report.validation_result.passed
-                                            if intelligence_report.validation_result else None),
-                    "validation_flags":    _val_flags,
-                },
-            )
-        except Exception as intel_err:
-            logger.warning(json.dumps({"event": "intelligence_layer_failed", "error": str(intel_err)}))
-            obs.emit_error(
-                stage=PipelineStage.USER_PROFILER,
-                error_category=ErrorCategory.PIPELINE,
-                error_code="INTELLIGENCE_LAYER_FAILED",
-                message=str(intel_err),
-                exc=intel_err,
-            )
-            _val_flags = []
-            _val_flags_count = 0
-            _confidence_before_validation = None
-            _downgrade_happened = False
-    else:
-        # Intelligence Layer not required for this query (factual only, no portfolio)
+        # ─ After Intelligence Pipeline: Confidence tracking & validation state ─
         logger.info(json.dumps({
-            "event": "intelligence_skipped",
-            "reason": "factual_query_no_portfolio",
-            "intent": intent,
+            "event": "intelligence_pipeline_complete",
+            "selected_action": str(_system_action) if _system_action else None,
+            "confidence_before_validation": _confidence_before_validation,
+            "final_confidence": pipeline_confidence,
+            "downgrade_happened": _downgrade_happened,
+            "validation_flags_count": _val_flags_count,
+            "agents_ran": intelligence_report.agents_ran,
+            "has_recommendations": intelligence_report.has_recommendations,
         }))
+
+        logger.info(json.dumps({
+            "event": "intelligence_layer_complete",
+            "agents_ran": intelligence_report.agents_ran,
+            "confidence": pipeline_confidence,
+            "has_recommendations": intelligence_report.has_recommendations,
+            "validation_passed": (
+                intelligence_report.validation_result.passed
+                if intelligence_report.validation_result else None
+            ),
+        }))
+        obs.emit(
+            PipelineStage.VALIDATION, "intelligence_layer_complete",
+            summary=f"Intelligence pipeline done — confidence={pipeline_confidence}, action={_system_action}",
+            latency_ms=(time.time() - t_intel) * 1000,
+            data={
+                "agents_ran":          intelligence_report.agents_ran,
+                "confidence":          pipeline_confidence,
+                "system_action":       _system_action,
+                "has_recommendations": intelligence_report.has_recommendations,
+                "validation_passed":   (intelligence_report.validation_result.passed
+                                        if intelligence_report.validation_result else None),
+                "validation_flags":    _val_flags,
+            },
+        )
+    except Exception as intel_err:
+        logger.warning(json.dumps({"event": "intelligence_layer_failed", "error": str(intel_err)}))
+        obs.emit_error(
+            stage=PipelineStage.USER_PROFILER,
+            error_category=ErrorCategory.PIPELINE,
+            error_code="INTELLIGENCE_LAYER_FAILED",
+            message=str(intel_err),
+            exc=intel_err,
+        )
         _val_flags = []
         _val_flags_count = 0
+        _confidence_before_validation = None
+        _downgrade_happened = False
+
+    # Build memory: load stored summary or create from history
+    history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
+    conversation_context = build_conversation_context(history_summary)
 
     user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
-                                      intelligence_block=intelligence_block)
+                                      intelligence_block=intelligence_block,
+                                      conversation_context=conversation_context)
     t_gen = time.time()
 
     # 🔹 6. Context Flags for Guidance Layer
@@ -905,9 +911,6 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
                 has_any_docs = count > 0
         except Exception as e:
             logger.warning(f"Failed to check document count: {e}")
-
-    # Build memory: load stored summary or re-summarize at interval boundary (Stage 13)
-    history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
 
     # 🔹 7. Prepend Flags to System Prompt
     system_content = (
@@ -1131,38 +1134,41 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
         metadata = result["latency_breakdown"].copy()
         metadata["reasoning_summary"] = reasoning_summary
         metadata["confidence_level"] = confidence_level
-        
+
         asyncio.create_task(save_message_to_db(
             pool, query.session_id, "assistant", answer, citations, metadata, suggested_questions
         ))
+
+        # Update session memory before response completes (ensure write is visible on next request)
+        try:
+            new_summary = SummaryBuilder.build(query.history + [type('Message', (), {'role': 'assistant', 'content': answer})])
+            if new_summary:
+                await SessionMemoryStore.set(query.owner_id, query.session_id, new_summary)
+        except Exception as e:
+            logger.warning(f"Failed to update session memory after response: {e}")
 
     # 🔹 6. Store in Redis Cache + Semantic Cache
     await redis_set(cache_key, {
         "data": result,
         "timestamp": time.time()
     })
-    # Semantic cache is only for non-deterministic (vector) queries.
-    # SQL-sourced answers are already covered by the exact-match Redis cache and must
-    # not pollute the semantic cache — a macro/FX answer stored here would be returned
-    # for semantically similar but structurally different ticker queries.
-    _has_sql_sources = any(s.get("source_type") == "sql" for s in sources)
-    if not _has_sql_sources:
-        await semantic_cache_store(query_vector, query.user_role, cache_key, owner_id=query.owner_id, question=query.question)
-    else:
-        logger.info(json.dumps({"event": "semantic_cache_store_skipped", "reason": "sql_result"}))
+    await semantic_cache_store(query_vector, query.user_role, cache_key, owner_id=query.owner_id)
 
     # 🔹 8. Strict Source Control Logging & Validation
-    retrieved_ids = {s['document_id'] for s in sources if s.get('document_id') and s['document_id'] != 'sql_query' and s['document_id'] != 'unknown'}
+    retrieved_ids = {s['document_id'] for s in sources if s.get('document_id') and s['document_id'] != 'unknown'}
     selected_ids = set(query.document_ids or [])
-    
+
     source_violation = False
     if selected_ids and not retrieved_ids.issubset(selected_ids):
         source_violation = True
         logger.error(f"STRICT SOURCE VIOLATION: Retrieved {retrieved_ids} is not subset of Selected {selected_ids}")
-    
+
+    # Extract display names from actual citations for debugging visibility
+    selected_source_names = [c.get("display_name") or c.get("id") for c in citations.values()]
+
     logger.info(json.dumps({
         "event": "query_processed",
-        "selected_sources": list(selected_ids),
+        "selected_sources": selected_source_names,
         "retrieved_sources": list(retrieved_ids),
         "source_violation": source_violation,
         "mode": "sync",
@@ -1197,187 +1203,262 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
 
 
-async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embed_model: SentenceTransformer, rerank_model: Any, query: ChatQuery) -> AsyncGenerator[str, None]:
-    t0 = time.time()
+# ── Stream Stage 1 ───────────────────────────────────────────────────────────
+
+async def _prepare_or_short_circuit_stream(
+    pool: asyncpg.Pool, query: "ChatQuery", pinecone_index: Any, t0: float
+) -> dict:
+    """Metric init, numeric shortcut guard, exact cache, semantic cache early returns.
+    Returns dict with 'short_circuit' bool. If True, 'packets' has all SSE strings to
+    yield before returning. If False, also provides cache_key, standalone_question,
+    query_vector, loop for downstream stages."""
     await state.incr_metric(state.METRIC_TOTAL)
 
-    # 🔹 0. NUMERIC SHORTCUT GUARD — user typed "1" or "a" instead of clicking a button
     if is_numeric_shortcut(query.question):
         logger.info(json.dumps({"event": "numeric_shortcut_rejected", "input_length": len(query.question.strip())}))
         if query.session_id:
             asyncio.create_task(save_message_to_db(pool, query.session_id, "user", query.question))
             asyncio.create_task(save_message_to_db(pool, query.session_id, "assistant", NUMERIC_SHORTCUT_RESPONSE))
-        try:
-            yield f"data: {json.dumps({'type': 'meta', 'sources': [], 'source_type': 'generated'})}\n\n"
-            yield f"data: {json.dumps({'type': 'token', 'content': NUMERIC_SHORTCUT_RESPONSE})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'total_time': 0.0})}\n\n"
-        finally:
-            await state.decr_active_streams()
-        return
+        await state.decr_active_streams()
+        return {
+            "short_circuit": True,
+            "packets": [
+                f"data: {json.dumps({'type': 'meta', 'sources': [], 'source_type': 'generated'})}\n\n",
+                f"data: {json.dumps({'type': 'token', 'content': NUMERIC_SHORTCUT_RESPONSE})}\n\n",
+                f"data: {json.dumps({'type': 'done', 'total_time': 0.0})}\n\n",
+            ],
+        }
 
     cache_key_input = f"{query.user_role}:{query.owner_id or ''}:{query.question}"
     cache_key = generate_cache_key(cache_key_input)
-    current_time = time.time()
-
     cache_entry = await redis_get(cache_key)
     if cache_entry is not None:
-        age = current_time - cache_entry["timestamp"]
+        age = time.time() - cache_entry["timestamp"]
+        cached = cache_entry["data"]
         if age > CACHE_SOFT_TTL:
             asyncio.create_task(regenerate_response(pinecone_index, query.question, cache_key, query.user_role))
-            cached = cache_entry["data"]
-            yield f"data: {json.dumps({'type': 'meta', 'sources': cached.get('sources', []), 'source_type': 'stale'})}\n\n"
-            yield f"data: {json.dumps({'type': 'token', 'content': cached['answer']})}\n\n"
+            source_type = "stale"
         else:
             await state.incr_metric(state.METRIC_HIT)
-            cached = cache_entry["data"]
-            yield f"data: {json.dumps({'type': 'meta', 'sources': cached.get('sources', []), 'source_type': 'cache'})}\n\n"
-            yield f"data: {json.dumps({'type': 'token', 'content': cached['answer']})}\n\n"
-
+            source_type = "cache"
         if query.session_id:
             asyncio.create_task(save_message_to_db(pool, query.session_id, "user", query.question))
             asyncio.create_task(save_message_to_db(pool, query.session_id, "assistant", cached["answer"], cached.get("citations"), {}))
-
-        yield f"data: {json.dumps({'type': 'done', 'total_time': round(time.time() - t0, 3)})}\n\n"
         await state.decr_active_streams()
-        return
+        return {
+            "short_circuit": True,
+            "packets": [
+                f"data: {json.dumps({'type': 'meta', 'sources': cached.get('sources', []), 'source_type': source_type})}\n\n",
+                f"data: {json.dumps({'type': 'token', 'content': cached['answer']})}\n\n",
+                f"data: {json.dumps({'type': 'done', 'total_time': round(time.time() - t0, 3)})}\n\n",
+            ],
+        }
 
     await state.incr_metric(state.METRIC_MISS)
 
     if not pinecone_index:
-        yield f"data: {json.dumps({'type': 'error', 'msg': 'Vector store not connected'})}\n\n"
         await state.decr_active_streams()
-        return
+        return {
+            "short_circuit": True,
+            "packets": [f"data: {json.dumps({'type': 'error', 'msg': 'Vector store not connected'})}\n\n"],
+        }
 
-    # 🔹 0. CONDENSE QUESTION
-    # Load stored summary early so condense_question can resolve references from older turns
-    condensation_summary = await load_session_summary(pool, query.session_id, query.owner_id) if query.session_id and query.owner_id else None
+    logger.info(json.dumps({"event": "prepare_memory_load_start", "session_id": query.session_id}))
+    try:
+        condensation_summary = (
+            await SessionMemoryStore.get(query.owner_id, query.session_id)
+            if query.session_id and query.owner_id else None
+        )
+        logger.info(json.dumps({"event": "prepare_memory_load_done", "has_summary": bool(condensation_summary)}))
+    except Exception as e:
+        logger.exception(json.dumps({"event": "prepare_memory_load_error", "exception": str(e)}))
+        condensation_summary = None
+
     standalone_question = await condense_question(query.history, query.question, summary=condensation_summary)
 
-    # 🔹 2. QUERY PLANNING
     loop = asyncio.get_running_loop()
     query_vector = await cached_embed(standalone_question, loop)
-    t_plan = time.time()
-    multi_plan = await QueryOrchestrator.get_plan(standalone_question, query_vector, query.user_role, owner_id=query.owner_id)
-    plan_time = time.time() - t_plan
-    
-    # 🔹 1. SEMANTIC CACHE LOOKUP (Optional on streaming)
-    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id, question=query.question)
+
+    sem_result = await semantic_cache_lookup(query_vector, query.user_role, owner_id=query.owner_id)
     if sem_result is not None:
         await state.incr_metric(state.METRIC_HIT)
-        yield f"data: {json.dumps({'type': 'meta', 'sources': sem_result.get('sources', []), 'source_type': 'semantic_cache'})}\n\n"
-        yield f"data: {json.dumps({'type': 'token', 'content': sem_result['answer']})}\n\n"
         if query.session_id:
             asyncio.create_task(save_message_to_db(pool, query.session_id, "user", query.question))
             asyncio.create_task(save_message_to_db(pool, query.session_id, "assistant", sem_result["answer"], sem_result.get("citations"), {}))
-        yield f"data: {json.dumps({'type': 'done', 'total_time': round(time.time() - t0, 3)})}\n\n"
         await state.decr_active_streams()
-        return
+        return {
+            "short_circuit": True,
+            "packets": [
+                f"data: {json.dumps({'type': 'meta', 'sources': sem_result.get('sources', []), 'source_type': 'semantic_cache'})}\n\n",
+                f"data: {json.dumps({'type': 'token', 'content': sem_result['answer']})}\n\n",
+                f"data: {json.dumps({'type': 'done', 'total_time': round(time.time() - t0, 3)})}\n\n",
+            ],
+        }
 
-    t_ret_start = time.time()
-    tasks = [
-        execute_sub_query(pool, pinecone_index, embed_model, rerank_model, p, query, loop, query.user_role)
-        for p in multi_plan.plans
-    ]
-    sub_results = await asyncio.gather(*tasks)
-    retrieval_time = time.time() - t_ret_start
-    
-    relevant_contexts, sources, metrics, citations = merge_contexts(sub_results)
+    return {
+        "short_circuit": False,
+        "packets": [],
+        "cache_key": cache_key,
+        "standalone_question": standalone_question,
+        "query_vector": query_vector,
+        "loop": loop,
+    }
+
+
+# ── Stream Stage 2 ───────────────────────────────────────────────────────────
+
+async def _run_retrieval_stage(
+    pool: asyncpg.Pool, pinecone_index: Any,
+    embed_model: SentenceTransformer, rerank_model: Any,
+    query: "ChatQuery", standalone_question: str,
+    query_vector: Any, loop: asyncio.AbstractEventLoop,
+) -> dict:
+    """Build plan → execute → fuse → fusion_to_context.
+    Returns retrieval dict: hybrid_plan, plan_time, retrieval_time,
+    relevant_contexts, sources, citations, metrics, context_block."""
+    t_plan = time.time()
+    hybrid_plan = _hybrid_build_plan(standalone_question, query.owner_id or "")
+    plan_time = time.time() - t_plan
+    logger.info(json.dumps({"event": "stage_retrieval_plan_built",
+                             "steps": hybrid_plan.plan_meta.total_steps,
+                             "hybrid": hybrid_plan.plan_meta.is_hybrid}))
+
+    t_ret = time.time()
+    _step_results = await _hybrid_execute_plan(
+        hybrid_plan, query.owner_id or "",
+        sql_runner=_make_sql_runner(pool),
+        vector_runner=_make_vector_runner(
+            standalone_question, pool, pinecone_index, embed_model, rerank_model, query, loop),
+    )
+    fusion_result = _hybrid_fuse(hybrid_plan, _step_results)
+    retrieval_time = time.time() - t_ret
+
+    relevant_contexts, sources, citations, metrics = _fusion_to_context(fusion_result)
+
+    # Contract guards
+    if not isinstance(sources, list):
+        logger.warning(json.dumps({"event": "retrieval_contract_violation", "field": "sources"}))
+        sources = []
+    if not isinstance(citations, dict):
+        logger.warning(json.dumps({"event": "retrieval_contract_violation", "field": "citations"}))
+        citations = {}
+    if not isinstance(relevant_contexts, list):
+        relevant_contexts = []
 
     context_block = "\n---\n".join(relevant_contexts) if relevant_contexts else ""
+    logger.info(json.dumps({"event": "stage_retrieval_complete",
+                             "context_count": len(relevant_contexts),
+                             "source_count": len(sources),
+                             "plan_time_ms": round(plan_time * 1000, 1),
+                             "retrieval_time_ms": round(retrieval_time * 1000, 1)}))
+    return {
+        "hybrid_plan": hybrid_plan, "plan_time": plan_time,
+        "retrieval_time": retrieval_time, "relevant_contexts": relevant_contexts,
+        "sources": sources, "citations": citations, "metrics": metrics,
+        "context_block": context_block,
+    }
 
-    # 🔹 6. Context Flags for Guidance Layer
+
+# ── Stream Stage 3 ───────────────────────────────────────────────────────────
+
+async def _build_guidance_stage(
+    pool: asyncpg.Pool, query: "ChatQuery",
+    standalone_question: str, context_block: str, sources: list,
+) -> dict:
+    """Portfolio context, user profile, has_documents, intent, intelligence layer.
+    Returns guidance dict consumed by prompt builder and observability stages."""
     portfolio_ctx = await fetch_portfolio_context(pool, query.owner_id)
     has_portfolio = portfolio_ctx is not None
     is_new_session = not query.history
-    # HAS_CONTEXT: were chunks actually retrieved for this query?
-    has_context = len(relevant_contexts) > 0
+    has_context = bool(context_block)
 
-    # 🔹 Personalization: User Profile Injection (Stream)
     user_profile = None
     profile_block = ""
     if query.owner_id:
         try:
             user_profile = await UserProfileService.get_profile(pool, query.owner_id)
             profile_block = UserProfileService.format_profile_for_prompt(user_profile)
-            # Trigger dynamic profile update in background
             asyncio.create_task(UserProfileService.update_profile_from_query(pool, query.owner_id, standalone_question))
         except Exception as e:
             logger.warning(f"Failed to fetch user profile in stream: {e}")
 
-    # HAS_DOCUMENTS: does the user have any successfully indexed documents?
     has_any_docs = False
     if query.owner_id:
         try:
             async with pool.acquire() as conn:
                 count = await conn.fetchval(
                     "SELECT COUNT(*) FROM documents WHERE owner_id = $1 AND status = 'completed'",
-                    query.owner_id
-                )
-                has_any_docs = count > 0
+                    query.owner_id)
+                has_any_docs = (count or 0) > 0
         except Exception as e:
             logger.warning(f"Failed to check document count in stream: {e}")
 
-    system_content = (
-        f"CONTEXT_FLAGS:\n"
-        f"HAS_CONTEXT={has_context}\n"
-        f"HAS_DOCUMENTS={has_any_docs}\n"
-        f"HAS_PORTFOLIO={has_portfolio}\n"
-        f"IS_NEW_SESSION={is_new_session}\n\n"
-        f"{profile_block}\n"
-        f"{CHAT_STREAM_PROMPT}"
-    )
     intent = classify_intent(standalone_question)
     if is_simulation_query(standalone_question):
         intent = "simulation"
 
-    # 🔹 5.5 INVESTMENT INTELLIGENCE LAYER (stream path — mirrors sync path)
-    # Intelligence Layer is needed only when intent signals advisory/analytical reasoning.
-    # Portfolio context alone does NOT trigger intelligence for factual queries.
-    stream_requires_intelligence = intent in ("advisory", "analytical", "simulation")
+    _system_action = "EXPLANATION" if not has_portfolio else "SYNTHESIS"
+    if intent == "advisory":
+        _system_action = "ADVISORY"
 
-    stream_intelligence_block = ""
-    stream_pipeline_confidence: str | None = None
+    intelligence_block = ""
+    pipeline_confidence: str | None = None
+    try:
+        intelligence_report = await IntelligenceOrchestrator.run(
+            question=standalone_question, intent=intent,
+            raw_profile=user_profile, owner_id=query.owner_id, pool=pool,
+        )
+        pipeline_confidence = intelligence_report.pipeline_confidence
+        intelligence_block = build_intelligence_context(intelligence_report)
+        logger.info(json.dumps({"event": "stage_guidance_intelligence_complete",
+                                 "agents_ran": intelligence_report.agents_ran,
+                                 "confidence": pipeline_confidence}))
+    except Exception as intel_err:
+        logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
 
-    if stream_requires_intelligence:
-        try:
-            stream_intelligence_report = await IntelligenceOrchestrator.run(
-                question=standalone_question,
-                intent=intent,
-                raw_profile=user_profile,
-                owner_id=query.owner_id,
-                pool=pool,
-            )
-            stream_pipeline_confidence = stream_intelligence_report.pipeline_confidence
-            stream_intelligence_block = build_intelligence_context(stream_intelligence_report)
-            logger.info(json.dumps({
-                "event": "intelligence_layer_complete_stream",
-                "agents_ran": stream_intelligence_report.agents_ran,
-                "confidence": stream_pipeline_confidence,
-            }))
-        except Exception as intel_err:
-            logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
-    else:
-        logger.info(json.dumps({
-            "event": "intelligence_skipped_stream",
-            "reason": "factual_query_no_portfolio",
-            "intent": intent,
-        }))
+    _llm_input_blocks = build_llm_input_blocks(intelligence_block, context_block, portfolio_ctx)
+    logger.info(json.dumps({"event": "stage_guidance_complete", "has_portfolio": has_portfolio,
+                             "has_any_docs": has_any_docs, "intent": intent,
+                             "has_intelligence": bool(intelligence_block)}))
+    return {
+        "portfolio_ctx": portfolio_ctx, "has_portfolio": has_portfolio,
+        "is_new_session": is_new_session, "has_context": has_context,
+        "user_profile": user_profile, "profile_block": profile_block,
+        "has_any_docs": has_any_docs, "intent": intent,
+        "intelligence_block": intelligence_block, "pipeline_confidence": pipeline_confidence,
+        "_system_action": _system_action, "_llm_input_blocks": _llm_input_blocks,
+    }
 
-    # 🔹 Build metadata for LLM tracing
-    _llm_input_blocks = build_llm_input_blocks(stream_intelligence_block, context_block, portfolio_ctx)
-    _system_action = "EXPLANATION" if not has_portfolio else "SYNTHESIS" # Baseline
-    if intent == "advisory": _system_action = "ADVISORY"
 
-    user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
-                                      intelligence_block=stream_intelligence_block)
+# ── Stream Stage 4 ───────────────────────────────────────────────────────────
 
-    # 🔹 Build conversation memory for stream path (matches sync path logic)
-    stream_history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
+async def _build_prompt_stage(
+    pool: asyncpg.Pool, query: "ChatQuery",
+    standalone_question: str, guidance: dict, retrieval: dict,
+) -> list[dict]:
+    """System prompt, user message, history summary → final stream_messages list."""
+    system_content = (
+        f"CONTEXT_FLAGS:\n"
+        f"HAS_CONTEXT={guidance['has_context']}\n"
+        f"HAS_DOCUMENTS={guidance['has_any_docs']}\n"
+        f"HAS_PORTFOLIO={guidance['has_portfolio']}\n"
+        f"IS_NEW_SESSION={guidance['is_new_session']}\n\n"
+        f"{guidance['profile_block']}\n"
+        f"{CHAT_STREAM_PROMPT}"
+    )
+    history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
+    conversation_context = build_conversation_context(history_summary)
 
-    # 🔹 Assemble message list with history (fixes stateless stream bug)
+    user_message = build_user_message(
+        retrieval["context_block"], standalone_question,
+        guidance["intent"], guidance["portfolio_ctx"],
+        intelligence_block=guidance["intelligence_block"],
+        conversation_context=conversation_context,
+    )
+
     stream_messages = [{"role": "system", "content": system_content}]
-    if stream_history_summary:
-        stream_messages.append({"role": "system", "content": f"Context Summary of previous conversation:\n{stream_history_summary}"})
+    if history_summary:
+        stream_messages.append({"role": "system", "content": f"Context Summary of previous conversation:\n{history_summary}"})
         for m in query.history[-3:]:
             stream_messages.append({"role": m.role, "content": m.content})
     else:
@@ -1385,220 +1466,321 @@ async def generate_stream_response(pool: asyncpg.Pool, pinecone_index: Any, embe
             stream_messages.append({"role": m.role, "content": m.content})
     stream_messages.append({"role": "user", "content": user_message})
 
-    deadline = time.time() + MAX_STREAM_DURATION
+    logger.info(json.dumps({"event": "stage_prompt_complete", "message_count": len(stream_messages),
+                             "has_history_summary": bool(history_summary)}))
+    return stream_messages
 
-    yield f"data: {json.dumps({'type': 'meta', 'sources': sources, 'citations': citations, 'source_type': 'generated', 'latency': {'embedding': round(metrics['embed'], 3), 'retrieval': round(retrieval_time, 3)}})}\n\n"
 
+# ── Stream Stage 5 ───────────────────────────────────────────────────────────
+
+async def _stream_llm_stage(
+    stream_messages: list[dict], deadline: float, result_bag: dict
+) -> AsyncGenerator[str, None]:
+    """Run ChatAgentClient.generate_stream, filter [[ ]] metadata, yield token events.
+    Caller must hold LLM_SEMAPHORE. Populates result_bag['full_answer'] and result_bag['gen_time']."""
     t3 = time.time()
-    collected_tokens = []
+    collected_tokens: list[str] = []
+    in_metadata_block = False
+
+    stream = ChatAgentClient.generate_stream(messages=stream_messages)
+    async for token in stream:
+        if time.time() > deadline:
+            logger.warning(json.dumps({"event": "stream_timeout", "max_duration_s": MAX_STREAM_DURATION}))
+            yield f"data: {json.dumps({'type': 'error', 'msg': 'Stream timed out'})}\n\n"
+            break
+
+        collected_tokens.append(token)
+
+        if "[[" in token:
+            in_metadata_block = True
+            clean_part = token.split("[[")[0]
+            if clean_part:
+                yield f"data: {json.dumps({'type': 'token', 'content': clean_part})}\n\n"
+            continue
+
+        if "]]" in token:
+            in_metadata_block = False
+            clean_part = token.split("]]")[-1]
+            if clean_part:
+                yield f"data: {json.dumps({'type': 'token', 'content': clean_part})}\n\n"
+            continue
+
+        if not in_metadata_block:
+            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+    result_bag["full_answer"] = "".join(collected_tokens)
+    result_bag["gen_time"] = time.time() - t3
+
+
+# ── Stream Stage 6 ───────────────────────────────────────────────────────────
+
+async def _finalize_result_stage(
+    pool: asyncpg.Pool, query: "ChatQuery",
+    full_answer: str, retrieval: dict, guidance: dict,
+    gen_time: float, t0: float, cache_key: str,
+) -> tuple[dict, list[str]]:
+    """Parse explainability/suggested questions, save messages, build result dict,
+    cache write, latency breakdown, source validation logging.
+    Returns (result, title_packets)."""
+    sources   = retrieval["sources"]
+    citations = retrieval["citations"]
+    metrics   = retrieval["metrics"]
+    plan_time      = retrieval["plan_time"]
+    retrieval_time = retrieval["retrieval_time"]
+    pipeline_confidence = guidance["pipeline_confidence"]
+
+    reasoning_summary = None
+    confidence_level  = pipeline_confidence
+    suggested_questions: list = []
+    answer = full_answer
+
+    if "[[Explainability:" in answer:
+        try:
+            parts = answer.split("[[Explainability:")
+            main_text = parts[0].strip()
+            exp_part  = parts[1].split("]]")[0].strip()
+            exp_data  = json.loads(exp_part)
+            reasoning_summary = exp_data.get("reasoning_summary")
+            if confidence_level is None:
+                confidence_level = exp_data.get("confidence_level")
+            after_exp = parts[1].split("]]")[1] if len(parts[1].split("]]")) > 1 else ""
+            answer = main_text
+            if "[[SuggestedQuestions:" in after_exp:
+                answer += f"\n\n[[SuggestedQuestions:{after_exp.split('[[SuggestedQuestions:')[1]}"
+        except Exception as e:
+            logger.warning(f"Failed to parse explainability in stream: {e}")
+
+    if "[[SuggestedQuestions:" in answer:
+        try:
+            parts = answer.split("[[SuggestedQuestions:")
+            answer = parts[0].strip()
+            suggested_questions = json.loads(parts[1].split("]]")[0].strip())
+        except Exception as e:
+            logger.warning(f"Failed to parse suggested questions in stream: {e}")
+            suggested_questions = []
+
+    safe_answer, _ = content_filter(answer)
+    total_time = time.time() - t0
+
+    title_packets: list[str] = []
+    if query.session_id:
+        metadata = {
+            "total_time": round(total_time, 3), "generation_time": round(gen_time, 3),
+            "reasoning_summary": reasoning_summary, "confidence_level": confidence_level,
+        }
+        new_title = await save_message_to_db(pool, query.session_id, "user", query.question)
+        if new_title:
+            title_packets.append(f"data: {json.dumps({'type': 'title', 'content': new_title})}\n\n")
+        asyncio.create_task(save_message_to_db(
+            pool, query.session_id, "assistant", safe_answer, citations, metadata, suggested_questions))
+
+        # Update session memory after successful response (ensure write completes)
+        try:
+            new_summary = SummaryBuilder.build(query.history + [type('Message', (), {'role': 'assistant', 'content': safe_answer})])
+            if new_summary:
+                await SessionMemoryStore.set(query.owner_id, query.session_id, new_summary)
+        except Exception as e:
+            logger.warning(f"Failed to update session memory after stream response: {e}")
+
+    result = {
+        "answer": safe_answer,
+        "sources":    sources    if isinstance(sources, list) else [],
+        "citations":  citations  if isinstance(citations, dict) else {},
+        "suggested_questions": suggested_questions,
+        "source_type": "generated",
+        "reasoning_summary": reasoning_summary,
+        "confidence_level":  confidence_level,
+        "latency_breakdown": {
+            "planning":   round(plan_time, 3),
+            "sql":        round(metrics.get("sql", 0), 3),
+            "embedding":  round(metrics.get("embed", 0), 3),
+            "routing":    round(metrics.get("routing", 0), 3),
+            "retrieval":  round(retrieval_time, 3),
+            "rerank":     round(metrics.get("rerank", 0), 3),
+            "generation": round(gen_time, 3),
+            "total":      round(total_time, 3),
+        },
+    }
+
+    await redis_set(cache_key, {"data": result, "timestamp": time.time()})
+    await state.record_value(state.LIST_LATENCY, total_time)
+
+    retrieved_ids = {s["document_id"] for s in sources
+                     if s.get("document_id") and s["document_id"] != "unknown"}
+    selected_ids  = set(query.document_ids or [])
+    source_violation = bool(selected_ids and not retrieved_ids.issubset(selected_ids))
+    if source_violation:
+        logger.error(f"STRICT SOURCE VIOLATION [STREAM]: Retrieved {retrieved_ids} is not subset of Selected {selected_ids}")
+
+    # Extract display names from actual citations for debugging visibility
+    selected_source_names = [c.get("display_name") or c.get("id") for c in citations.values()]
+
+    logger.info(json.dumps({
+        "event": "query_processed", "mode": "stream",
+        "selected_sources": selected_source_names, "retrieved_sources": list(retrieved_ids),
+        "source_violation": source_violation,
+        "question_hash": generate_cache_key(query.question)[:8],
+        "total_s": round(total_time, 3),
+        "embed_s": round(metrics.get("embed", 0), 3),
+        "retrieval_s": round(retrieval_time, 3),
+        "rerank_s": round(metrics.get("rerank", 0), 3),
+        "generation_s": round(gen_time, 3),
+    }))
+    logger.info(json.dumps({"event": "stage_finalize_result_complete",
+                             "total_time_ms": round(total_time * 1000, 1)}))
+    return result, title_packets
+
+
+# ── Stream Stage 7 ───────────────────────────────────────────────────────────
+
+async def _finalize_observability_stage(
+    pool: asyncpg.Pool, query: "ChatQuery",
+    full_answer: str, result: dict, guidance: dict,
+    gen_time: float, t0: float,
+) -> list[str]:
+    """Final meta packet, done packet, LLM introspection, audit log.
+    Returns the two terminal SSE packets."""
+    total_time = time.time() - t0
+    pipeline_confidence = guidance["pipeline_confidence"]
+    _system_action    = guidance["_system_action"]
+    _llm_input_blocks = guidance["_llm_input_blocks"]
+    intelligence_block = guidance["intelligence_block"]
+
+    packets = [
+        f"data: {json.dumps({'type': 'meta', 'reasoning_summary': result.get('reasoning_summary'), 'confidence_level': result.get('confidence_level'), 'suggested_questions': result.get('suggested_questions', []), 'latency': result['latency_breakdown']})}\n\n",
+        f"data: {json.dumps({'type': 'done', 'total_time': round(total_time, 3), 'generation_time': round(gen_time, 3), 'answer_length': len(full_answer)})}\n\n",
+    ]
 
     try:
-        await asyncio.wait_for(LLM_SEMAPHORE.acquire(), timeout=LLM_WAIT_TIMEOUT)
-    except asyncio.TimeoutError:
-        yield f"data: {json.dumps({'type': 'error', 'msg': 'Server busy — too many concurrent LLM requests. Try again in a few seconds.'})}\n\n"
-        await state.decr_active_streams()
-        return
+        _llm_output = build_llm_output_structure(
+            answer=full_answer, suggested_questions=result.get("suggested_questions", []),
+            pipeline_confidence=pipeline_confidence,
+            reasoning_summary=result.get("reasoning_summary"), system_action=_system_action,
+        )
+        _llm_behavior = analyze_llm_behavior(
+            response=full_answer, pipeline_confidence=pipeline_confidence,
+            system_action=_system_action, validation_flags=[],
+            input_blocks=_llm_input_blocks,
+        )
+        _llm_trace = LLMTrace(
+            req_id=obs._req_id(), input_blocks=_llm_input_blocks,
+            constraints=LLMConstraints(
+                forbidden_operations_applied=True, no_arithmetic_mode=True,
+                cite_only_directive=True, intelligence_block_injected=bool(intelligence_block),
+            ),
+            output_structure=_llm_output, behavior=_llm_behavior,
+            latency_ms=gen_time * 1000,
+        )
+        obs.emit_llm_trace(_llm_trace)
+    except Exception as introspection_err:
+        logger.warning(f"LLM Introspection failed in stream: {introspection_err}")
+
+    asyncio.create_task(log_audit_event(
+        pool=pool, event_type="chat", user_id=query.owner_id,
+        resource_id=query.session_id, action="read", status="success",
+        metadata={
+            "mode": "stream", "latency_ms": int(total_time * 1000),
+            "message_length": len(query.question), "response_length": len(full_answer),
+            "source_count": len(result.get("sources", [])), "is_cache_hit": False,
+        },
+    ))
+    logger.info(json.dumps({"event": "stage_finalize_obs_complete",
+                             "total_time_ms": round(total_time * 1000, 1)}))
+    return packets
+
+
+# ── generate_stream_response: 7-stage orchestrator ───────────────────────────
+
+async def generate_stream_response(
+    pool: asyncpg.Pool, pinecone_index: Any,
+    embed_model: SentenceTransformer, rerank_model: Any,
+    query: ChatQuery,
+) -> AsyncGenerator[str, None]:
+    t0 = time.time()
 
     try:
-        stream = ChatAgentClient.generate_stream(
-            messages=stream_messages
+        # Stage 1 — prepare / short-circuit
+        logger.info(json.dumps({"event": "stage_prepare_start"}))
+        stage1 = await _prepare_or_short_circuit_stream(pool, query, pinecone_index, t0)
+        for pkt in stage1["packets"]:
+            yield pkt
+        if stage1["short_circuit"]:
+            return
+
+        cache_key           = stage1["cache_key"]
+        standalone_question = stage1["standalone_question"]
+        query_vector        = stage1["query_vector"]
+        loop                = stage1["loop"]
+
+        # Stage 2 — retrieval
+        logger.info(json.dumps({"event": "stage_retrieval_start"}))
+        retrieval = await _run_retrieval_stage(
+            pool, pinecone_index, embed_model, rerank_model,
+            query, standalone_question, query_vector, loop,
         )
 
-        in_metadata_block = False
-        async for token in stream:
-            if time.time() > deadline:
-                logger.warning(f"Stream timeout after {MAX_STREAM_DURATION}s")
-                yield f"data: {json.dumps({'type': 'error', 'msg': 'Stream timed out'})}\n\n"
-                break
-            
-            collected_tokens.append(token)
-            
-            # 🛡️ Robust Metadata Filtering
-            # We want to avoid streaming anything between [[ and ]]
-            if "[[" in token:
-                in_metadata_block = True
-                # If there's text before [[, stream only that
-                clean_part = token.split("[[")[0]
-                if clean_part:
-                     yield f"data: {json.dumps({'type': 'token', 'content': clean_part})}\n\n"
-                continue
-            
-            if "]]" in token:
-                in_metadata_block = False
-                # If there's text after ]], stream only that (rare)
-                clean_part = token.split("]]")[-1]
-                if clean_part:
-                     yield f"data: {json.dumps({'type': 'token', 'content': clean_part})}\n\n"
-                continue
+        # Stage 3 — guidance
+        logger.info(json.dumps({"event": "stage_guidance_start"}))
+        guidance = await _build_guidance_stage(
+            pool, query, standalone_question,
+            retrieval["context_block"], retrieval["sources"],
+        )
 
-            if not in_metadata_block:
-                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-        
-        gen_time = time.time() - t3
-        total_time = time.time() - t0
+        # Stage 4 — prompt build
+        logger.info(json.dumps({"event": "stage_prompt_start"}))
+        stream_messages = await _build_prompt_stage(pool, query, standalone_question, guidance, retrieval)
 
-        full_answer = "".join(collected_tokens)
+        # Initial meta packet (client receives sources before LLM starts)
+        yield (
+            f"data: {json.dumps({'type': 'meta', 'sources': retrieval['sources'], 'citations': retrieval['citations'], 'source_type': 'generated', 'latency': {'embedding': round(retrieval['metrics'].get('embed', 0), 3), 'retrieval': round(retrieval['retrieval_time'], 3)}})}\n\n"
+        )
 
-        # 🔹 Parse explainability and suggested questions from collected tokens
-        reasoning_summary = None
-        # Deterministic confidence takes priority over LLM self-reported value
-        confidence_level = stream_pipeline_confidence
-        suggested_questions = []
+        deadline   = time.time() + MAX_STREAM_DURATION
+        result_bag: dict = {}
 
-        if "[[Explainability:" in full_answer:
-            try:
-                parts = full_answer.split("[[Explainability:")
-                main_text = parts[0].strip()
-                exp_part = parts[1].split("]]")[0].strip()
-                exp_data = json.loads(exp_part)
-                reasoning_summary = exp_data.get("reasoning_summary")
-                # Only fall back to LLM confidence when intelligence layer didn't run
-                if confidence_level is None:
-                    confidence_level = exp_data.get("confidence_level")
-                
-                after_exp = parts[1].split("]]")[1] if len(parts[1].split("]]")) > 1 else ""
-                full_answer = main_text
-                if "[[SuggestedQuestions:" in after_exp:
-                    full_answer += f"\n\n[[SuggestedQuestions:{after_exp.split('[[SuggestedQuestions:')[1]}"
-            except Exception as e:
-                logger.warning(f"Failed to parse explainability in stream: {e}")
-
-        if "[[SuggestedQuestions:" in full_answer:
-            try:
-                parts = full_answer.split("[[SuggestedQuestions:")
-                full_answer = parts[0].strip()
-                questions_part = parts[1].split("]]")[0].strip()
-                suggested_questions = json.loads(questions_part)
-            except Exception as e:
-                logger.warning(f"Failed to parse suggested questions in stream: {e}")
-
-        # 🔹 Save messages to DB after stream finishes (uses parsed reasoning_summary + confidence_level)
-        if query.session_id:
-            # Prepare metadata (stored in latency column)
-            metadata = {
-                "total_time": round(total_time, 3),
-                "generation_time": round(gen_time, 3),
-                "reasoning_summary": reasoning_summary,
-                "confidence_level": confidence_level
-            }
-
-            new_title = await save_message_to_db(pool, query.session_id, "user", query.question)
-            if new_title:
-                yield f"data: {json.dumps({'type': 'title', 'content': new_title})}\n\n"
-            asyncio.create_task(save_message_to_db(
-                pool, query.session_id, "assistant", full_answer, citations, metadata, suggested_questions
-            ))
-        safe_answer, _ = content_filter(full_answer)
-        
-        result = {
-            "answer": safe_answer,
-            "sources": sources,
-            "citations": citations,
-            "suggested_questions": suggested_questions,
-            "source_type": "generated",
-            "reasoning_summary": reasoning_summary,
-            "confidence_level": confidence_level,
-            "latency_breakdown": {
-                "planning": round(plan_time, 3),
-                "sql": round(metrics["sql"], 3),
-                "embedding": round(metrics["embed"], 3),
-                "routing": round(metrics["routing"], 3),
-                "retrieval": round(retrieval_time, 3),
-                "rerank": round(metrics["rerank"], 3),
-                "generation": round(gen_time, 3),
-                "total": round(total_time, 3)
-            }
-        }
-
-        await redis_set(cache_key, {
-            "data": result,
-            "timestamp": time.time()
-        })
-
-        await state.record_value(state.LIST_LATENCY, total_time)
-
-        # 🔹 8. Strict Source Control Logging & Validation
-        retrieved_ids = {s['document_id'] for s in sources if s.get('document_id') and s['document_id'] != 'sql_query' and s['document_id'] != 'unknown'}
-        selected_ids = set(query.document_ids or [])
-        
-        source_violation = False
-        if selected_ids and not retrieved_ids.issubset(selected_ids):
-            source_violation = True
-            logger.error(f"STRICT SOURCE VIOLATION [STREAM]: Retrieved {retrieved_ids} is not subset of Selected {selected_ids}")
-
-        logger.info(json.dumps({
-            "event": "query_processed",
-            "selected_sources": list(selected_ids),
-            "retrieved_sources": list(retrieved_ids),
-            "source_violation": source_violation,
-            "mode": "stream",
-            "question_hash": generate_cache_key(query.question)[:8],
-            "total_s": round(total_time, 3),
-            "embed_s": round(metrics["embed"], 3),
-            "retrieval_s": round(retrieval_time, 3),
-            "rerank_s": round(metrics["rerank"], 3),
-            "generation_s": round(gen_time, 3)
-        }))
-
-        # Final meta packet with explainability, suggested questions and FULL latency breakdown
-        yield f"data: {json.dumps({'type': 'meta', 'reasoning_summary': reasoning_summary, 'confidence_level': confidence_level, 'suggested_questions': suggested_questions, 'latency': result['latency_breakdown']})}\n\n"
-        yield f"data: {json.dumps({'type': 'done', 'total_time': round(total_time, 3), 'generation_time': round(gen_time, 3), 'answer_length': len(full_answer)})}\n\n"
-
-        # 🔹 LLM INTROSPECTION — build and emit the full LLM trace (STREAM PATH)
         try:
-            _llm_output = build_llm_output_structure(
-                answer=full_answer,
-                suggested_questions=suggested_questions,
-                pipeline_confidence=stream_pipeline_confidence,
-                reasoning_summary=reasoning_summary,
-                system_action=_system_action,
-            )
-            # Fetch validation flags if any (simulated for now or extract from previous steps)
-            _val_flags = [] # Optional: connect to ValidationAgent if used in stream
+            await asyncio.wait_for(LLM_SEMAPHORE.acquire(), timeout=LLM_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'error', 'msg': 'Server busy — too many concurrent LLM requests. Try again in a few seconds.'})}\n\n"
+            await state.decr_active_streams()
+            return
 
-            _llm_behavior = analyze_llm_behavior(
-                response=full_answer,
-                pipeline_confidence=stream_pipeline_confidence,
-                system_action=_system_action,
-                validation_flags=_val_flags,
-                input_blocks=_llm_input_blocks,
-            )
-            _llm_trace = LLMTrace(
-                req_id=obs._req_id(),
-                input_blocks=_llm_input_blocks,
-                constraints=LLMConstraints(
-                    forbidden_operations_applied=True,
-                    no_arithmetic_mode=True,
-                    cite_only_directive=True,
-                    intelligence_block_injected=bool(stream_intelligence_block),
-                ),
-                output_structure=_llm_output,
-                behavior=_llm_behavior,
-                latency_ms=gen_time * 1000,
-            )
-            obs.emit_llm_trace(_llm_trace)
-        except Exception as introspection_err:
-            logger.warning(f"LLM Introspection failed in stream: {introspection_err}")
+        try:
+            # Stage 5 — LLM streaming
+            logger.info(json.dumps({"event": "stage_stream_llm_start"}))
+            async for pkt in _stream_llm_stage(stream_messages, deadline, result_bag):
+                yield pkt
 
-        # 🔹 Audit Log (Metadata only)
-        asyncio.create_task(log_audit_event(
-            pool=pool,
-            event_type="chat",
-            user_id=query.owner_id,
-            resource_id=query.session_id,
-            action="read",
-            status="success",
-            metadata={
-                "mode": "stream",
-                "latency_ms": int(total_time * 1000),
-                "message_length": len(query.question),
-                "response_length": len(full_answer),
-                "source_count": len(sources),
-                "is_cache_hit": False # Streaming is usually a miss
-            }
-        ))
+            full_answer = result_bag.get("full_answer", "")
+            gen_time    = result_bag.get("gen_time", 0.0)
 
+            # Stage 6 — finalize result
+            logger.info(json.dumps({"event": "stage_finalize_result_pre"}))
+            result, title_packets = await _finalize_result_stage(
+                pool, query, full_answer, retrieval, guidance, gen_time, t0, cache_key)
+            logger.info(json.dumps({"event": "stage_finalize_result_post"}))
+            for pkt in title_packets:
+                yield pkt
 
-    finally:
-        LLM_SEMAPHORE.release()
-        await state.decr_active_streams()
+            # Stage 7 — finalize observability
+            logger.info(json.dumps({"event": "stage_finalize_obs_pre"}))
+            for pkt in await _finalize_observability_stage(
+                    pool, query, full_answer, result, guidance, gen_time, t0):
+                yield pkt
+            logger.info(json.dumps({"event": "stage_finalize_obs_post"}))
+
+        except Exception as e:
+            logger.exception(json.dumps({
+                "event": "stream_crash",
+                "exception": str(e),
+            }))
+        finally:
+            LLM_SEMAPHORE.release()
+            await state.decr_active_streams()
+
+    except Exception as e:
+        logger.exception(json.dumps({
+            "event": "stream_crash_prepare_stage",
+            "exception": str(e),
+            "message": "Crash in prepare/retrieval/guidance stages",
+        }))
