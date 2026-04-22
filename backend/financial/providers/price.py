@@ -83,9 +83,9 @@ class StooqProvider(BaseProvider):
 
         return rows
 
-    async def store(self, rows: list[dict]) -> int:
+    async def store(self, pool: asyncpg.Pool, rows: list[dict]) -> int:
         """Upsert price rows to the database (skip duplicates)."""
-        return await upsert_prices(rows)
+        return await upsert_prices(pool, rows)
 
     async def get_last_date(self) -> date | None:
         """Check the latest date we have for this symbol (for incremental updates)."""

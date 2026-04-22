@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
@@ -16,6 +17,7 @@ from observability.routes import router as observability_router
 from core.logger import get_logger, setup_logging
 from core.middleware import add_request_id
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
 import core.db as db
 
 # ── Unified Logging — MUST run before app initialization ──
@@ -23,16 +25,47 @@ setup_logging()
 logger = get_logger(__name__)
 
 
+async def _seed_holdings_if_empty(pool) -> None:
+    """
+    Non-blocking startup hook: ingest SPY and QQQ holdings if etf_holdings is empty.
+    Runs as a background task — never blocks server startup.
+    Subsequent startups are no-ops (hash-based skip inside HoldingsProvider).
+    """
+    try:
+        count = await pool.fetchval("SELECT COUNT(*) FROM etf_holdings")
+        if count == 0:
+            logger.info("etf_holdings empty — seeding SPY and QQQ holdings on startup...")
+            from financial.providers.holdings import HoldingsProvider
+            result = await HoldingsProvider().ingest(pool, symbols=["SPY", "QQQ"])
+            logger.info(
+                f"Holdings seed: processed={result['processed']}, "
+                f"updated={result['updated']}, "
+                f"skipped={result['skipped']}, failed={result['failed']}"
+            )
+        else:
+            logger.info(f"etf_holdings already populated ({count} rows) — seed skipped")
+    except Exception as e:
+        logger.warning(f"ETF holdings seed failed (non-fatal): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app):
     """Startup/shutdown hooks — manage the DB connection pool and ML models."""
     logger.info("Initializing Investment Intelligence Engine...")
-    
+
     # 1. Database
-    await db.get_pool()
+    pool = await db.get_pool()
     logger.info("Database pool ready")
-    
-    # 2. ML Models (CPU/RAM intensive)
+
+    # 2. Seed ETF holdings — gated behind AUTO_SEED_HOLDINGS_ON_STARTUP (default: true)
+    auto_seed = os.getenv("AUTO_SEED_HOLDINGS_ON_STARTUP", "true").lower() == "true"
+    if auto_seed:
+        logger.info("AUTO_SEED_HOLDINGS_ON_STARTUP=true — scheduling background ETF holdings seed (first query may arrive before seed completes)")
+        asyncio.create_task(_seed_holdings_if_empty(pool))
+    else:
+        logger.info("AUTO_SEED_HOLDINGS_ON_STARTUP=false — startup ETF holdings seed disabled; seed manually via /financial/ingest/holdings")
+
+    # 3. ML Models (CPU/RAM intensive)
     from core.connections import load_ml_models
     load_ml_models()
     

@@ -29,20 +29,22 @@ Role: Design and verify test cases.
   cd frontend && npx playwright test
   ```
 - Router Test Cases:
-  | Input | Source | Expected |
+  | Input | Path | Expected |
   |---|---|---|
   | USD/ILS rate | sql | fx_rate: USD→ILS |
   | מה שער הדולר | sql | fx_rate: USD→ILS |
   | AAPL price | sql | price_lookup: AAPL |
-  | price of that | vector | document_analysis |
+  | price of that | no-match | vector retrieval (no SQL) |
   | inflation | sql | macro_series: CPIAUCNS |
   | אינפלציה | sql | macro_series: CPIAUCNS |
-  | portfolio risks | vector | portfolio → vector |
-  | USD/ILS + risk | sql+vector | fx_rate + document_analysis |
-  | invalid JSON | sql/vector | fallback fires |
-  | no intent | vector | raw question |
+  | portfolio risks | no-match | vector retrieval (no SQL) |
+  | USD/ILS + risk | hybrid | fx_rate (SQL) + vector context |
+  | what does the Apple 10-K say about revenue | vector | vector retrieval only |
+  | AAPL price + latest 10-K risk factors | hybrid | price_lookup (SQL) + vector retrieval |
+  | invalid params | no-match | vector only (no retry, no SQL) |
+  | no intent | no-match | vector only (no SQL) |
 
-- Assertions: Correct source; correct query; no {owner_id} literal; Hebrew → English params; unknown → document_analysis (not exception)
+- Assertions: Correct source path (sql / vector / hybrid / no-match); valid SQL when SQL path; no {owner_id} literal in SQL; Hebrew → English params; owner_id in all Pinecone metadata filters; unknown → no-match (vector, not exception); hybrid returns fused context from both sources
 
 ## Modes
 
@@ -52,6 +54,4 @@ Design: Current behavior → smallest safe change → files → criteria → ris
 
 Build: Restate task → approach → confirm files → smallest implementation → preserve patterns
 
-Review: Correctness → security boundaries → multi-tenant isolation → scope creep → one verdict (APPROVED / FIX REQUIRED / REJECT)
-
-Test: Test cases → expected behavior → failure indicators → exact commands
+Review: Correctness → security boundaries → multi-te
