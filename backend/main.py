@@ -27,25 +27,72 @@ logger = get_logger(__name__)
 
 async def _seed_holdings_if_empty(pool) -> None:
     """
-    Non-blocking startup hook: ingest SPY and QQQ holdings if etf_holdings is empty.
-    Runs as a background task — never blocks server startup.
-    Subsequent startups are no-ops (hash-based skip inside HoldingsProvider).
+    Non-blocking startup hook: seed SPY and QQQ holdings if either is missing.
+    Checks per-symbol so a partial prior run does not block the missing symbol.
+    Subsequent startups skip symbols that already have rows.
     """
     try:
-        count = await pool.fetchval("SELECT COUNT(*) FROM etf_holdings")
-        if count == 0:
-            logger.info("etf_holdings empty — seeding SPY and QQQ holdings on startup...")
+        missing = []
+        for symbol in ["SPY", "QQQ"]:
+            count = await pool.fetchval(
+                "SELECT COUNT(*) FROM etf_holdings WHERE etf_symbol = $1", symbol
+            )
+            if count == 0:
+                missing.append(symbol)
+
+        if missing:
+            logger.info(f"etf_holdings missing for {missing} — seeding on startup...")
             from financial.providers.holdings import HoldingsProvider
-            result = await HoldingsProvider().ingest(pool, symbols=["SPY", "QQQ"])
+            result = await HoldingsProvider().ingest(pool, symbols=missing)
             logger.info(
                 f"Holdings seed: processed={result['processed']}, "
                 f"updated={result['updated']}, "
                 f"skipped={result['skipped']}, failed={result['failed']}"
             )
         else:
-            logger.info(f"etf_holdings already populated ({count} rows) — seed skipped")
+            logger.info("etf_holdings already populated for SPY and QQQ — seed skipped")
     except Exception as e:
         logger.warning(f"ETF holdings seed failed (non-fatal): {e}")
+
+
+async def _seed_prices_if_empty(pool) -> None:
+    """
+    Non-blocking startup hook: seed SPY and QQQ daily prices if missing.
+    Uses YFinancePriceProvider (no API key required). Idempotent via ON CONFLICT DO NOTHING.
+    """
+    try:
+        from financial.providers.price import YFinancePriceProvider
+        for symbol in ["SPY", "QQQ"]:
+            count = await pool.fetchval(
+                "SELECT COUNT(*) FROM prices WHERE symbol = $1", symbol
+            )
+            if count == 0:
+                logger.info(f"prices empty for {symbol} — seeding from Yahoo Finance...")
+                result = await YFinancePriceProvider(symbol=symbol).ingest(pool)
+                logger.info(f"Price seed {symbol}: {result.get('status')}, rows={result.get('rows_ingested', 0)}")
+            else:
+                logger.info(f"prices already populated for {symbol} ({count} rows) — skipped")
+    except Exception as e:
+        logger.warning(f"Price seed failed (non-fatal): {e}")
+
+
+async def _seed_macro_if_empty(pool) -> None:
+    """
+    Non-blocking startup hook: seed core FRED macro series if macro_series table is empty.
+    Requires a valid FRED_API_KEY in the environment.
+    """
+    try:
+        count = await pool.fetchval("SELECT COUNT(*) FROM macro_series")
+        if count == 0:
+            logger.info("macro_series empty — seeding FRED series on startup...")
+            from financial.providers.macro import FREDProvider
+            for series_id in ["CPIAUCNS", "FEDFUNDS", "GDP", "UNRATE"]:
+                result = await FREDProvider(series_id=series_id).ingest(pool)
+                logger.info(f"Macro seed {series_id}: {result.get('status')}, rows={result.get('rows_ingested', 0)}")
+        else:
+            logger.info(f"macro_series already populated ({count} rows) — seed skipped")
+    except Exception as e:
+        logger.warning(f"Macro seed failed (non-fatal): {e}")
 
 
 @asynccontextmanager
@@ -57,13 +104,15 @@ async def lifespan(app):
     pool = await db.get_pool()
     logger.info("Database pool ready")
 
-    # 2. Seed ETF holdings — gated behind AUTO_SEED_HOLDINGS_ON_STARTUP (default: true)
+    # 2. Seed data — gated behind AUTO_SEED_HOLDINGS_ON_STARTUP (default: true)
     auto_seed = os.getenv("AUTO_SEED_HOLDINGS_ON_STARTUP", "true").lower() == "true"
     if auto_seed:
-        logger.info("AUTO_SEED_HOLDINGS_ON_STARTUP=true — scheduling background ETF holdings seed (first query may arrive before seed completes)")
+        logger.info("AUTO_SEED_HOLDINGS_ON_STARTUP=true — scheduling background seed tasks")
         asyncio.create_task(_seed_holdings_if_empty(pool))
+        asyncio.create_task(_seed_prices_if_empty(pool))
+        asyncio.create_task(_seed_macro_if_empty(pool))
     else:
-        logger.info("AUTO_SEED_HOLDINGS_ON_STARTUP=false — startup ETF holdings seed disabled; seed manually via /financial/ingest/holdings")
+        logger.info("AUTO_SEED_HOLDINGS_ON_STARTUP=false — startup seeds disabled; seed manually via /financial/ingest/*")
 
     # 3. ML Models (CPU/RAM intensive)
     from core.connections import load_ml_models
