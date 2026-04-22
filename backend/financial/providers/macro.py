@@ -151,7 +151,7 @@ class FREDProvider(BaseProvider):
         """
         return await upsert_macro_series(pool, rows)
 
-    async def get_last_date(self) -> date | None:
+    async def get_last_date(self, pool: asyncpg.Pool) -> date | None:
         """
         Check the latest date we have for this specific series.
 
@@ -160,9 +160,9 @@ class FREDProvider(BaseProvider):
         different providers in the future. We only want to check
         what THIS provider has already stored.
         """
-        return await get_last_macro_date(self.series_id, self.provider_name)
+        return await get_last_macro_date(pool, self.series_id, self.provider_name)
 
-    async def ingest_incremental(self) -> dict:
+    async def ingest_incremental(self, pool: asyncpg.Pool) -> dict:
         """
         Smart ingestion: only fetch data newer than what we already have.
 
@@ -174,7 +174,7 @@ class FREDProvider(BaseProvider):
 
         This saves API calls and avoids re-processing old data.
         """
-        last = await self.get_last_date()
+        last = await self.get_last_date(pool)
         if last:
             self.start = last + timedelta(days=1)
             if self.start > self.end:
@@ -184,6 +184,6 @@ class FREDProvider(BaseProvider):
                     "status": "up_to_date",
                     "rows_ingested": 0,
                 }
-        result = await self.ingest()
+        result = await self.ingest(pool)
         result["series_id"] = self.series_id
         return result
