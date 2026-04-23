@@ -47,6 +47,7 @@ Full index: [claude/CLAUDE.md](claude/CLAUDE.md)
 | Personalization / user profiles | system_behavior.md |
 | SQL queries / data | project.md + schema.md + state.md |
 | Source / data debugging | project.md + system_behavior.md + state.md |
+| Debug factual vs advisory behavior | system_behavior.md + state.md |
 | Security / rules | engineering_rules.md |
 | Testing | workflow.md |
 | New feature | stack.md + architecture.md + engineering_rules.md |
@@ -58,6 +59,7 @@ Full index: [claude/CLAUDE.md](claude/CLAUDE.md)
 - Use minimal context required
 - Prefer targeted file loading
 - If unsure → load [claude/debug/known_issues.md](claude/debug/known_issues.md) first
+- **Do not assume missing data = system failure** — empty SQL results are valid states (portfolio empty, macro unavailable)
 
 ## Working Method (Agent-Based)
 

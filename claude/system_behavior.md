@@ -1,6 +1,6 @@
 # System Behavior
 
-## Request Flow
+## Request Flow — Advisory Mode (Default)
 1. Layered cache lookup (exact → semantic, Redis)
 2. If miss: router.py decomposes query → intent JSON + source selection (SQL / vector / hybrid)
 3. Validate params: normalize → FX direction → validate → build query plan per source
@@ -15,10 +15,28 @@
    - Stage 5: ValidationAgent (can only downgrade)
 7. build_intelligence_context() → [NORMALIZED PORTFOLIO] + [VALIDATION]
 8. build_user_message (intelligence context + citations + optional conversation summary)
-9. (NEW) conversation context injection:
+9. conversation context injection:
    - If session history exists → include summarized context
    - If no history → proceed stateless
 10. security.py PII filter → OpenAI (synthesis only, no SQL injection) → confidence → cache + return
+
+## Factual Mode (Pure SQL Queries)
+
+**Triggers**
+- Single intent with valid SQL params: etf_holdings, portfolio_lookup, price_lookup, fx_rate
+- No accompanying vector intent; no advisory context requested
+
+**Path**
+1. Planner: SQL-only source selected; no knowledge_query step added
+2. Executor: SQL query runs; empty result returns status=empty (not error)
+3. Fusion: structured_data populated; no profile injection; no intelligence layer invoked
+4. Response: direct answer style (facts only, no reasoning synthesis)
+
+**Constraints**
+- Intelligence layer (all 7 agents) is skipped
+- User profile NOT injected into context
+- No LLM synthesis; only data assembly
+- Empty SQL result (0 rows) is valid end state; no fallback to vector
 
 ## Retrieval Layer — Planner → Executor → Fusion
 
@@ -107,6 +125,7 @@ QueryPlan
 - Generate dynamic SQL
 - Inject owner_id into SQL params
 - Override source selection via LLM
+- Add knowledge_query for pure SQL queries (factual mode)
 
 **Implementation Status**
 - Schemas: VectorFilter, PlanStep, PlanMeta, HybridQueryPlan (backend/rag/schemas.py)
@@ -163,11 +182,11 @@ StepResult
 - `user_profile` (optional) — advisory only
 
 **Flow**
-1. Partition: `sql_results` ← SQL steps `ok`; `vector_results` ← VECTOR/NO_MATCH steps `ok`
-2. Collect empty/error steps → generate `missing_data_notes`
-3. Build `structured_data` from sql_results (keyed by intent_type, data untouched)
+1. Partition: `sql_results` ← SQL steps `ok` or `empty`; `vector_results` ← VECTOR/NO_MATCH steps `ok`
+2. Collect error steps → generate `missing_data_notes`; empty steps are **explicitly injected** as valid results
+3. Build `structured_data` from sql_results (keyed by intent_type, data untouched; empty arrays are valid)
 4. Build `supporting_context` from vector_results (chunks with source provenance)
-5. Append profile as `advisory_context` in `retrieval_summary`
+5. Append profile as `advisory_context` in `retrieval_summary` (factual mode: profile NOT appended)
 
 **Merge Rules**
 - SQL data → `structured_data` only; never merged into `supporting_context`
