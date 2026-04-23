@@ -45,7 +45,7 @@ _CONTEXTUAL_KEYWORDS = [
     "strategy",
     "השפעה", "ניתוח", "סיכון", "המלצה",
 ]
-_ETF_KEYWORDS = ["etf", "etfs", "composition", "holdings", "החזקות", "הרכב"]
+_ETF_KEYWORDS = ["etf", "etfs", "composition", "holdings", "positions", "largest", "top holdings", "החזקות", "הרכב"]
 _PRICE_KEYWORDS = ["price", "stock", "close", "open", "מניה", "מחיר", "performance"]
 
 # Uppercase words that must not be treated as tickers
@@ -99,6 +99,18 @@ def _extract_explicit_ticker(text: str) -> Optional[str]:
     return None
 
 
+def _extract_all_tickers(text: str) -> list[str]:
+    """Returns all unique 2–5 char uppercase words that are not known non-tickers, in order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for m in _TICKER_RE.finditer(text):
+        candidate = m.group(1)
+        if candidate not in _NON_TICKERS and candidate not in seen:
+            seen.add(candidate)
+            result.append(candidate)
+    return result
+
+
 # ── Intent detection ──────────────────────────────────────────────────────────
 
 def _detect_intents(query: str, system_context: dict) -> list[dict]:
@@ -131,11 +143,13 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
     ticker = _extract_explicit_ticker(query)
     if ticker:
         if _has_any(query, _ETF_KEYWORDS):
-            intents.append({
-                "intent_type": "etf_holdings",
-                "raw_params": {"symbol": ticker},
-                "is_sql": True,
-            })
+            # One SQL step per ticker — supports "compare SPY and QQQ" multi-symbol queries
+            for t in _extract_all_tickers(query)[:_MAX_STEPS]:
+                intents.append({
+                    "intent_type": "etf_holdings",
+                    "raw_params": {"symbol": t},
+                    "is_sql": True,
+                })
         elif _has_any(query, _PRICE_KEYWORDS):
             intents.append({
                 "intent_type": "price_lookup",
