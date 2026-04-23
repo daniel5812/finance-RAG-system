@@ -19,7 +19,7 @@ from core.state import LLM_SEMAPHORE
 from documents.routing import route_and_search
 from sentence_transformers import SentenceTransformer
 from rag.schemas import ChatQuery
-from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
+from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, FACTUAL_HOLDINGS_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
 from core.session_memory import SessionMemoryStore, SummaryBuilder
 import asyncpg
 from uuid import UUID
@@ -922,13 +922,15 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             logger.warning(f"Failed to check document count: {e}")
 
     # 🔹 7. Prepend Flags to System Prompt
+    # Select prompt based on whether intelligence layer ran
+    response_prompt = CHAT_SYSTEM_PROMPT if not _skip_intelligence else FACTUAL_HOLDINGS_PROMPT
     system_content = (
         f"CONTEXT_FLAGS:\n"
         f"HAS_CONTEXT={has_context}\n"
         f"HAS_DOCUMENTS={has_any_docs}\n"
         f"HAS_PORTFOLIO={has_portfolio}\n"
         f"IS_NEW_SESSION={is_new_session}\n\n"
-        f"{CHAT_SYSTEM_PROMPT}"
+        f"{response_prompt}"
     )
     messages = [{"role": "system", "content": system_content}]
 
@@ -1445,6 +1447,7 @@ async def _build_guidance_stage(
         "has_any_docs": has_any_docs, "intent": intent,
         "intelligence_block": intelligence_block, "pipeline_confidence": pipeline_confidence,
         "_system_action": _system_action, "_llm_input_blocks": _llm_input_blocks,
+        "_skip_intelligence": _skip_intelligence,
     }
 
 
@@ -1455,6 +1458,7 @@ async def _build_prompt_stage(
     standalone_question: str, guidance: dict, retrieval: dict,
 ) -> list[dict]:
     """System prompt, user message, history summary → final stream_messages list."""
+    response_prompt = CHAT_STREAM_PROMPT if not guidance.get('_skip_intelligence', False) else FACTUAL_HOLDINGS_PROMPT
     system_content = (
         f"CONTEXT_FLAGS:\n"
         f"HAS_CONTEXT={guidance['has_context']}\n"
@@ -1462,7 +1466,7 @@ async def _build_prompt_stage(
         f"HAS_PORTFOLIO={guidance['has_portfolio']}\n"
         f"IS_NEW_SESSION={guidance['is_new_session']}\n\n"
         f"{guidance['profile_block']}\n"
-        f"{CHAT_STREAM_PROMPT}"
+        f"{response_prompt}"
     )
     history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
     conversation_context = build_conversation_context(history_summary)
