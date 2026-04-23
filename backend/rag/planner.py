@@ -58,6 +58,8 @@ _NON_TICKERS = {
     # Exclude single letters (junk from SPDR, S&P, etc.)
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
     "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    # Fund family names (SPDR S&P, iShares, Vanguard, State Street) — not tickers
+    "SPDR", "ISHARES", "VANGUARD", "STATE", "STREET",
 }
 
 _TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')

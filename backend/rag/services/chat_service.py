@@ -1373,6 +1373,7 @@ async def _run_retrieval_stage(
 async def _build_guidance_stage(
     pool: asyncpg.Pool, query: "ChatQuery",
     standalone_question: str, context_block: str, sources: list,
+    hybrid_plan=None,
 ) -> dict:
     """Portfolio context, user profile, has_documents, intent, intelligence layer.
     Returns guidance dict consumed by prompt builder and observability stages."""
@@ -1412,7 +1413,14 @@ async def _build_guidance_stage(
 
     intelligence_block = ""
     pipeline_confidence: str | None = None
+    _skip_intelligence = (
+        hybrid_plan and bool(hybrid_plan.steps)
+        and all(s.source_type == "SQL" and s.intent_type == "etf_holdings"
+                for s in hybrid_plan.steps)
+    )
     try:
+        if _skip_intelligence:
+            raise RuntimeError("__skip_intelligence__")
         intelligence_report = await IntelligenceOrchestrator.run(
             question=standalone_question, intent=intent,
             raw_profile=user_profile, owner_id=query.owner_id, pool=pool,
@@ -1423,7 +1431,8 @@ async def _build_guidance_stage(
                                  "agents_ran": intelligence_report.agents_ran,
                                  "confidence": pipeline_confidence}))
     except Exception as intel_err:
-        logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
+        if str(intel_err) != "__skip_intelligence__":
+            logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
 
     _llm_input_blocks = build_llm_input_blocks(intelligence_block, context_block, portfolio_ctx)
     logger.info(json.dumps({"event": "stage_guidance_complete", "has_portfolio": has_portfolio,
@@ -1733,6 +1742,7 @@ async def generate_stream_response(
         guidance = await _build_guidance_stage(
             pool, query, standalone_question,
             retrieval["context_block"], retrieval["sources"],
+            hybrid_plan=retrieval["hybrid_plan"],
         )
 
         # Stage 4 — prompt build
