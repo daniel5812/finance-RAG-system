@@ -47,6 +47,7 @@ _CONTEXTUAL_KEYWORDS = [
 ]
 _ETF_KEYWORDS = ["etf", "etfs", "composition", "holdings", "positions", "largest", "top holdings", "החזקות", "הרכב"]
 _PRICE_KEYWORDS = ["price", "stock", "close", "open", "מניה", "מחיר", "performance"]
+_PORTFOLIO_KEYWORDS = ["portfolio", "my portfolio", "my holdings", "my positions", "what do i own", "התיק שלי", "הפורטפוליו שלי", "ההחזקות שלי"]
 
 # Uppercase words that must not be treated as tickers
 _NON_TICKERS = {
@@ -70,6 +71,7 @@ _SQL_TEMPLATE_IDS = {
     "price_lookup": "price_lookup_30d",
     "macro_series": "macro_series_12",
     "etf_holdings": "etf_holdings_top20",
+    "portfolio_lookup": "portfolio_lookup_positions",
 }
 
 # vector doc_type per intent
@@ -186,7 +188,11 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
     ):
         intents.append({"intent_type": "document_lookup", "raw_params": {}, "is_sql": False})
 
-    # 6. no intent detected → no_match
+    # 6. portfolio_lookup: user asking about their portfolio
+    if _has_any(query, _PORTFOLIO_KEYWORDS):
+        intents.append({"intent_type": "portfolio_lookup", "raw_params": {}, "is_sql": True})
+
+    # 7. no intent detected → no_match
     if not intents:
         return [{"intent_type": "no_match", "raw_params": {}, "is_sql": False}]
 
@@ -204,7 +210,7 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
 
 # ── SQL param resolution ──────────────────────────────────────────────────────
 
-def _resolve_sql(intent: dict, query: str) -> tuple[dict, Optional[str]]:
+def _resolve_sql(intent: dict, query: str, owner_id: Optional[str] = None) -> tuple[dict, Optional[str]]:
     """Returns (validated_params, error). error=None means valid."""
     itype = intent["intent_type"]
     raw = intent["raw_params"]
@@ -234,6 +240,11 @@ def _resolve_sql(intent: dict, query: str) -> tuple[dict, Optional[str]]:
         if not re.match(r"^[A-Z]{1,5}$", s):
             return {}, f"etf_holdings: invalid symbol '{s}'"
         return {"symbol": s}, None
+
+    if itype == "portfolio_lookup":
+        if not owner_id:
+            return {}, "portfolio_lookup: owner_id required"
+        return {"user_id": owner_id}, None
 
     return {}, f"unknown sql intent: {itype}"
 
@@ -283,7 +294,7 @@ def build_plan(
         itype = intent["intent_type"]
 
         if intent.get("is_sql"):
-            params, error = _resolve_sql(intent, query)
+            params, error = _resolve_sql(intent, query, owner_id)
             if error:
                 logger.warning(f"planner: {itype} → NO_MATCH ({error})")
                 steps.append(PlanStep(

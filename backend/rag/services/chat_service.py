@@ -371,6 +371,7 @@ _SQL_LABEL_MAP = {
     "macro_series": "Macro Indicators",
     "price_lookup": "Market Prices",
     "etf_holdings": "ETF Holdings",
+    "portfolio_lookup": "Portfolio Positions",
 }
 
 # Template SQL strings — params are planner-resolved (not raw user input)
@@ -381,6 +382,8 @@ _SQL_TEMPLATES = {
     "price_lookup_30d":  "SELECT symbol, date, close FROM prices WHERE symbol='{ticker}' ORDER BY date DESC LIMIT 30",
     # Fix B: etf_holdings planner resolves to {"symbol": ...}, not {"ticker": ...}
     "etf_holdings_top20":"SELECT etf_symbol, holding_symbol, weight FROM etf_holdings WHERE etf_symbol='{symbol}' ORDER BY weight DESC LIMIT 20",
+    # Portfolio positions: user's actual holdings (parameterized by user_id)
+    "portfolio_lookup_positions": "SELECT symbol, quantity, cost_basis, currency, account FROM portfolio_positions WHERE source = 'manual' AND user_id = '{user_id}' ORDER BY date DESC LIMIT 50",
 }
 
 
