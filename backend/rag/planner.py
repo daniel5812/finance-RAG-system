@@ -198,11 +198,11 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
 
     # 7. Hybrid: add knowledge_query VECTOR step if SQL steps exist + contextual keywords
     #    but no vector step yet (filing/document already satisfy this if present)
-    #    SKIP for pure etf_holdings comparisons (e.g., "Compare SPY and QQQ") — keep factual
+    #    SKIP for pure factual SQL (etf_holdings or portfolio_lookup) — keep factual mode
     has_sql = any(i["is_sql"] for i in intents)
     has_vector = any(not i["is_sql"] for i in intents)
-    all_etf_holdings = all(i["intent_type"] == "etf_holdings" for i in intents if i.get("is_sql"))
-    if has_sql and not has_vector and _has_any(query, _CONTEXTUAL_KEYWORDS) and not all_etf_holdings:
+    all_factual_sql = all(i["intent_type"] in ("etf_holdings", "portfolio_lookup") for i in intents if i.get("is_sql"))
+    if has_sql and not has_vector and _has_any(query, _CONTEXTUAL_KEYWORDS) and not all_factual_sql:
         intents.append({"intent_type": "knowledge_query", "raw_params": {}, "is_sql": False})
 
     return intents[:_MAX_STEPS]
