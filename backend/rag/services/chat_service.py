@@ -811,7 +811,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     _downgrade_happened: bool = False
     _skip_intelligence = (
         bool(hybrid_plan.steps)
-        and all(s.source_type == "SQL" and s.intent_type == "etf_holdings"
+        and all(s.source_type == "SQL" and s.intent_type in ("etf_holdings", "portfolio_lookup")
                 for s in hybrid_plan.steps)
     )
     t_intel = time.time()
@@ -939,7 +939,8 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     # 🔹 6. Personalization: User Profile Injection (Stage: Proactive Advisor)
     # user_profile was already fetched early (before intelligence layer) — reuse it here
-    if query.owner_id and user_profile:
+    # Skip profile block for factual queries (_skip_intelligence=True) to avoid advisory language leakage
+    if query.owner_id and user_profile and not _skip_intelligence:
         try:
             profile_block = UserProfileService.format_profile_for_prompt(user_profile)
             messages.append({"role": "system", "content": profile_block})
@@ -1420,7 +1421,7 @@ async def _build_guidance_stage(
     pipeline_confidence: str | None = None
     _skip_intelligence = (
         hybrid_plan and bool(hybrid_plan.steps)
-        and all(s.source_type == "SQL" and s.intent_type == "etf_holdings"
+        and all(s.source_type == "SQL" and s.intent_type in ("etf_holdings", "portfolio_lookup")
                 for s in hybrid_plan.steps)
     )
     try:
@@ -1462,13 +1463,15 @@ async def _build_prompt_stage(
 ) -> list[dict]:
     """System prompt, user message, history summary → final stream_messages list."""
     response_prompt = CHAT_STREAM_PROMPT if not guidance.get('_skip_intelligence', False) else FACTUAL_HOLDINGS_PROMPT
+    # Omit profile block for factual queries to prevent advisory language leakage
+    profile_section = "" if guidance.get('_skip_intelligence', False) else guidance['profile_block']
     system_content = (
         f"CONTEXT_FLAGS:\n"
         f"HAS_CONTEXT={guidance['has_context']}\n"
         f"HAS_DOCUMENTS={guidance['has_any_docs']}\n"
         f"HAS_PORTFOLIO={guidance['has_portfolio']}\n"
         f"IS_NEW_SESSION={guidance['is_new_session']}\n\n"
-        f"{guidance['profile_block']}\n"
+        f"{profile_section}"
         f"{response_prompt}"
     )
     history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
