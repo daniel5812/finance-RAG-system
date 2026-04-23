@@ -39,13 +39,12 @@ def fuse(
     missing_data_notes: list[str] = []
 
     for r in results:
-        if r.status == "ok":
-            if r.source_type == "SQL":
-                # Keyed by intent_type; last writer wins on collision (shouldn't happen)
-                structured_data[r.intent_type] = r.data
-            else:  # VECTOR or NO_MATCH
-                supporting_context.extend(r.data)
-        else:
+        # Include empty SQL results in structured_data so they appear in context
+        if r.source_type == "SQL" and r.status in ("ok", "empty"):
+            structured_data[r.intent_type] = r.data
+        elif r.status == "ok" and r.source_type in ("VECTOR", "NO_MATCH"):
+            supporting_context.extend(r.data)
+        elif r.status == "error":
             note = f"{r.intent_type} ({r.source_type}): {r.status}"
             if r.error_message:
                 note += f" — {r.error_message}"
@@ -55,7 +54,7 @@ def fuse(
     plan_has_sql = any(s.source_type == "SQL" for s in plan.steps)
     plan_has_vector = any(s.source_type in ("VECTOR", "NO_MATCH") for s in plan.steps)
 
-    results_has_sql = any(r.source_type == "SQL" and r.status == "ok" for r in results)
+    results_has_sql = any(r.source_type == "SQL" and r.status in ("ok", "empty") for r in results)
     results_has_vector = any(r.source_type in ("VECTOR", "NO_MATCH") and r.status == "ok" for r in results)
 
     # Summary includes both planned intent and actual retrieval
