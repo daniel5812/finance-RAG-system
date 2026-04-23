@@ -807,8 +807,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     _confidence_before_validation: str | None = None
     _downgrade_happened: bool = False
     _skip_intelligence = (
-        not portfolio_ctx
-        and bool(hybrid_plan.steps)
+        bool(hybrid_plan.steps)
         and all(s.source_type == "SQL" and s.intent_type == "etf_holdings"
                 for s in hybrid_plan.steps)
     )
