@@ -435,7 +435,8 @@ def _fusion_to_context(fusion_result) -> tuple:
 
     for intent_type, rows in (fusion_result.structured_data or {}).items():
         label = _SQL_LABEL_MAP.get(intent_type, "Financial Data")
-        sql_text = f"{label} Result:\n{_format_sql_rows_as_text(rows)}"
+        row_limit = 20 if intent_type == "etf_holdings" else 3
+        sql_text = f"{label} Result:\n{_format_sql_rows_as_text(rows, max_rows=row_limit)}"
         tag = f"[S{len(contexts)+1}]"
         contexts.append(f"Source {tag}: {sql_text}")
         citations[tag] = {"source_type": "sql", "id": "sql_query",
@@ -805,8 +806,16 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     _system_action: str | None = None
     _confidence_before_validation: str | None = None
     _downgrade_happened: bool = False
+    _skip_intelligence = (
+        not portfolio_ctx
+        and bool(hybrid_plan.steps)
+        and all(s.source_type == "SQL" and s.intent_type == "etf_holdings"
+                for s in hybrid_plan.steps)
+    )
     t_intel = time.time()
     try:
+        if _skip_intelligence:
+            raise RuntimeError("__skip_intelligence__")
         intelligence_report = await IntelligenceOrchestrator.run(
             question=standalone_question,
             intent=intent,
@@ -872,14 +881,15 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             },
         )
     except Exception as intel_err:
-        logger.warning(json.dumps({"event": "intelligence_layer_failed", "error": str(intel_err)}))
-        obs.emit_error(
-            stage=PipelineStage.USER_PROFILER,
-            error_category=ErrorCategory.PIPELINE,
-            error_code="INTELLIGENCE_LAYER_FAILED",
-            message=str(intel_err),
-            exc=intel_err,
-        )
+        if str(intel_err) != "__skip_intelligence__":
+            logger.warning(json.dumps({"event": "intelligence_layer_failed", "error": str(intel_err)}))
+            obs.emit_error(
+                stage=PipelineStage.USER_PROFILER,
+                error_category=ErrorCategory.PIPELINE,
+                error_code="INTELLIGENCE_LAYER_FAILED",
+                message=str(intel_err),
+                exc=intel_err,
+            )
         _val_flags = []
         _val_flags_count = 0
         _confidence_before_validation = None
