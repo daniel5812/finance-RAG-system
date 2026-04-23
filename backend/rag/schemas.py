@@ -113,3 +113,23 @@ class PlanMeta(BaseModel):
 class HybridQueryPlan(BaseModel):
     steps: List[PlanStep]
     plan_meta: PlanMeta
+
+class StepResult(BaseModel):
+    step_id: int
+    source_type: Literal["SQL", "VECTOR", "NO_MATCH"]
+    intent_type: str
+    data: List[Any] = []
+    status: Literal["ok", "empty", "error"] = "empty"
+    error_message: Optional[str] = None
+
+class RetrievalSummary(BaseModel):
+    has_sql: bool
+    has_vector: bool
+    is_partial: bool
+    advisory_context: Optional[Dict[str, Any]] = None
+
+class FusionResult(BaseModel):
+    structured_data: Dict[str, Any] = {}
+    supporting_context: List[Any] = []
+    missing_data_notes: List[str] = []
+    retrieval_summary: RetrievalSummary
