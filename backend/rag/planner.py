@@ -161,6 +161,16 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
                 "raw_params": {"ticker": ticker},
                 "is_sql": True,
             })
+    # ETF description fallback: "SPDR S&P 500 ETF" → SPY (when no explicit ticker extracted)
+    elif not ticker and _has_any(query, _ETF_KEYWORDS):
+        if re.search(r'\bspdr\s+s\s*&?\s*p\b', q):
+            ticker = "SPY"
+            for t in [ticker][:_MAX_STEPS]:
+                intents.append({
+                    "intent_type": "etf_holdings",
+                    "raw_params": {"symbol": t},
+                    "is_sql": True,
+                })
 
     # 4. filing_lookup: SEC filing keywords
     if _has_any(query, _FILING_KEYWORDS):
