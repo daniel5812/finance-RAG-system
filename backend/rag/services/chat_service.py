@@ -19,7 +19,7 @@ from core.state import LLM_SEMAPHORE
 from documents.routing import route_and_search
 from sentence_transformers import SentenceTransformer
 from rag.schemas import ChatQuery
-from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, FACTUAL_HOLDINGS_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
+from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, NATURAL_ADVISORY_PROMPT, FACTUAL_HOLDINGS_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
 from core.session_memory import SessionMemoryStore, SummaryBuilder
 import asyncpg
 from uuid import UUID
@@ -926,7 +926,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
 
     # 🔹 7. Prepend Flags to System Prompt
     # Select prompt based on whether intelligence layer ran
-    response_prompt = CHAT_SYSTEM_PROMPT if not _skip_intelligence else FACTUAL_HOLDINGS_PROMPT
+    response_prompt = NATURAL_ADVISORY_PROMPT if not _skip_intelligence else FACTUAL_HOLDINGS_PROMPT
     system_content = (
         f"CONTEXT_FLAGS:\n"
         f"HAS_CONTEXT={has_context}\n"
@@ -1462,7 +1462,7 @@ async def _build_prompt_stage(
     standalone_question: str, guidance: dict, retrieval: dict,
 ) -> list[dict]:
     """System prompt, user message, history summary → final stream_messages list."""
-    response_prompt = CHAT_STREAM_PROMPT if not guidance.get('_skip_intelligence', False) else FACTUAL_HOLDINGS_PROMPT
+    response_prompt = NATURAL_ADVISORY_PROMPT if not guidance.get('_skip_intelligence', False) else FACTUAL_HOLDINGS_PROMPT
     # Omit profile block for factual queries to prevent advisory language leakage
     profile_section = "" if guidance.get('_skip_intelligence', False) else guidance['profile_block']
     system_content = (
