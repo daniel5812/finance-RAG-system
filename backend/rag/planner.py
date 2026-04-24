@@ -47,6 +47,7 @@ _CONTEXTUAL_KEYWORDS = [
 ]
 _ETF_KEYWORDS = ["etf", "etfs", "composition", "holdings", "positions", "largest", "top holdings", "החזקות", "הרכב"]
 _PRICE_KEYWORDS = ["price", "stock", "close", "open", "מניה", "מחיר", "performance"]
+_PORTFOLIO_KEYWORDS = ["portfolio", "my portfolio", "my holdings", "my positions", "what do i own", "התיק שלי", "הפורטפוליו שלי", "ההחזקות שלי"]
 
 # Uppercase words that must not be treated as tickers
 _NON_TICKERS = {
@@ -55,6 +56,11 @@ _NON_TICKERS = {
     "GDP", "CPI", "FED", "IMF", "US", "AI", "IT", "UK",
     "EU", "FX", "OR", "IN", "AT", "BY", "DO", "IS", "AN",
     "TO", "BE", "ON", "OF", "AM", "PM",
+    # Exclude single letters (junk from SPDR, S&P, etc.)
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    # Fund family names (SPDR S&P, iShares, Vanguard, State Street) — not tickers
+    "SPDR", "ISHARES", "VANGUARD", "STATE", "STREET",
 }
 
 _TICKER_RE = re.compile(r'\b([A-Z]{2,5})\b')
@@ -65,6 +71,7 @@ _SQL_TEMPLATE_IDS = {
     "price_lookup": "price_lookup_30d",
     "macro_series": "macro_series_12",
     "etf_holdings": "etf_holdings_top20",
+    "portfolio_lookup": "portfolio_lookup_positions",
 }
 
 # vector doc_type per intent
@@ -156,6 +163,16 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
                 "raw_params": {"ticker": ticker},
                 "is_sql": True,
             })
+    # ETF description fallback: "SPDR S&P 500 ETF" → SPY (when no explicit ticker extracted)
+    elif not ticker and _has_any(query, _ETF_KEYWORDS):
+        if re.search(r'\bspdr\s+s\s*&?\s*p\b', q):
+            ticker = "SPY"
+            for t in [ticker][:_MAX_STEPS]:
+                intents.append({
+                    "intent_type": "etf_holdings",
+                    "raw_params": {"symbol": t},
+                    "is_sql": True,
+                })
 
     # 4. filing_lookup: SEC filing keywords
     if _has_any(query, _FILING_KEYWORDS):
@@ -171,15 +188,21 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
     ):
         intents.append({"intent_type": "document_lookup", "raw_params": {}, "is_sql": False})
 
-    # 6. no intent detected → no_match
+    # 6. portfolio_lookup: user asking about their portfolio
+    if _has_any(query, _PORTFOLIO_KEYWORDS):
+        intents.append({"intent_type": "portfolio_lookup", "raw_params": {}, "is_sql": True})
+
+    # 7. no intent detected → no_match
     if not intents:
         return [{"intent_type": "no_match", "raw_params": {}, "is_sql": False}]
 
     # 7. Hybrid: add knowledge_query VECTOR step if SQL steps exist + contextual keywords
     #    but no vector step yet (filing/document already satisfy this if present)
+    #    SKIP for pure factual SQL (etf_holdings or portfolio_lookup) — keep factual mode
     has_sql = any(i["is_sql"] for i in intents)
     has_vector = any(not i["is_sql"] for i in intents)
-    if has_sql and not has_vector and _has_any(query, _CONTEXTUAL_KEYWORDS):
+    all_factual_sql = all(i["intent_type"] in ("etf_holdings", "portfolio_lookup") for i in intents if i.get("is_sql"))
+    if has_sql and not has_vector and _has_any(query, _CONTEXTUAL_KEYWORDS) and not all_factual_sql:
         intents.append({"intent_type": "knowledge_query", "raw_params": {}, "is_sql": False})
 
     return intents[:_MAX_STEPS]
@@ -187,7 +210,7 @@ def _detect_intents(query: str, system_context: dict) -> list[dict]:
 
 # ── SQL param resolution ──────────────────────────────────────────────────────
 
-def _resolve_sql(intent: dict, query: str) -> tuple[dict, Optional[str]]:
+def _resolve_sql(intent: dict, query: str, owner_id: Optional[str] = None) -> tuple[dict, Optional[str]]:
     """Returns (validated_params, error). error=None means valid."""
     itype = intent["intent_type"]
     raw = intent["raw_params"]
@@ -217,6 +240,11 @@ def _resolve_sql(intent: dict, query: str) -> tuple[dict, Optional[str]]:
         if not re.match(r"^[A-Z]{1,5}$", s):
             return {}, f"etf_holdings: invalid symbol '{s}'"
         return {"symbol": s}, None
+
+    if itype == "portfolio_lookup":
+        if not owner_id:
+            return {}, "portfolio_lookup: owner_id required"
+        return {"user_id": owner_id}, None
 
     return {}, f"unknown sql intent: {itype}"
 
@@ -266,7 +294,7 @@ def build_plan(
         itype = intent["intent_type"]
 
         if intent.get("is_sql"):
-            params, error = _resolve_sql(intent, query)
+            params, error = _resolve_sql(intent, query, owner_id)
             if error:
                 logger.warning(f"planner: {itype} → NO_MATCH ({error})")
                 steps.append(PlanStep(

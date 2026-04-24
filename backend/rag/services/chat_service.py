@@ -19,7 +19,7 @@ from core.state import LLM_SEMAPHORE
 from documents.routing import route_and_search
 from sentence_transformers import SentenceTransformer
 from rag.schemas import ChatQuery
-from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
+from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, NATURAL_ADVISORY_PROMPT, FACTUAL_HOLDINGS_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
 from core.session_memory import SessionMemoryStore, SummaryBuilder
 import asyncpg
 from uuid import UUID
@@ -371,6 +371,7 @@ _SQL_LABEL_MAP = {
     "macro_series": "Macro Indicators",
     "price_lookup": "Market Prices",
     "etf_holdings": "ETF Holdings",
+    "portfolio_lookup": "Portfolio Positions",
 }
 
 # Template SQL strings — params are planner-resolved (not raw user input)
@@ -381,6 +382,8 @@ _SQL_TEMPLATES = {
     "price_lookup_30d":  "SELECT symbol, date, close FROM prices WHERE symbol='{ticker}' ORDER BY date DESC LIMIT 30",
     # Fix B: etf_holdings planner resolves to {"symbol": ...}, not {"ticker": ...}
     "etf_holdings_top20":"SELECT etf_symbol, holding_symbol, weight FROM etf_holdings WHERE etf_symbol='{symbol}' ORDER BY weight DESC LIMIT 20",
+    # Portfolio positions: user's actual holdings (parameterized by user_id)
+    "portfolio_lookup_positions": "SELECT symbol, quantity, cost_basis, currency, account FROM portfolio_positions WHERE source = 'manual' AND user_id = '{user_id}' ORDER BY date DESC LIMIT 50",
 }
 
 
@@ -807,9 +810,8 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     _confidence_before_validation: str | None = None
     _downgrade_happened: bool = False
     _skip_intelligence = (
-        not portfolio_ctx
-        and bool(hybrid_plan.steps)
-        and all(s.source_type == "SQL" and s.intent_type == "etf_holdings"
+        bool(hybrid_plan.steps)
+        and all(s.source_type == "SQL" and s.intent_type in ("etf_holdings", "portfolio_lookup")
                 for s in hybrid_plan.steps)
     )
     t_intel = time.time()
@@ -923,19 +925,22 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             logger.warning(f"Failed to check document count: {e}")
 
     # 🔹 7. Prepend Flags to System Prompt
+    # Select prompt based on whether intelligence layer ran
+    response_prompt = NATURAL_ADVISORY_PROMPT if not _skip_intelligence else FACTUAL_HOLDINGS_PROMPT
     system_content = (
         f"CONTEXT_FLAGS:\n"
         f"HAS_CONTEXT={has_context}\n"
         f"HAS_DOCUMENTS={has_any_docs}\n"
         f"HAS_PORTFOLIO={has_portfolio}\n"
         f"IS_NEW_SESSION={is_new_session}\n\n"
-        f"{CHAT_SYSTEM_PROMPT}"
+        f"{response_prompt}"
     )
     messages = [{"role": "system", "content": system_content}]
 
     # 🔹 6. Personalization: User Profile Injection (Stage: Proactive Advisor)
     # user_profile was already fetched early (before intelligence layer) — reuse it here
-    if query.owner_id and user_profile:
+    # Skip profile block for factual queries (_skip_intelligence=True) to avoid advisory language leakage
+    if query.owner_id and user_profile and not _skip_intelligence:
         try:
             profile_block = UserProfileService.format_profile_for_prompt(user_profile)
             messages.append({"role": "system", "content": profile_block})
@@ -1374,6 +1379,7 @@ async def _run_retrieval_stage(
 async def _build_guidance_stage(
     pool: asyncpg.Pool, query: "ChatQuery",
     standalone_question: str, context_block: str, sources: list,
+    hybrid_plan=None,
 ) -> dict:
     """Portfolio context, user profile, has_documents, intent, intelligence layer.
     Returns guidance dict consumed by prompt builder and observability stages."""
@@ -1413,7 +1419,14 @@ async def _build_guidance_stage(
 
     intelligence_block = ""
     pipeline_confidence: str | None = None
+    _skip_intelligence = (
+        hybrid_plan and bool(hybrid_plan.steps)
+        and all(s.source_type == "SQL" and s.intent_type in ("etf_holdings", "portfolio_lookup")
+                for s in hybrid_plan.steps)
+    )
     try:
+        if _skip_intelligence:
+            raise RuntimeError("__skip_intelligence__")
         intelligence_report = await IntelligenceOrchestrator.run(
             question=standalone_question, intent=intent,
             raw_profile=user_profile, owner_id=query.owner_id, pool=pool,
@@ -1424,7 +1437,8 @@ async def _build_guidance_stage(
                                  "agents_ran": intelligence_report.agents_ran,
                                  "confidence": pipeline_confidence}))
     except Exception as intel_err:
-        logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
+        if str(intel_err) != "__skip_intelligence__":
+            logger.warning(json.dumps({"event": "intelligence_layer_failed_stream", "error": str(intel_err)}))
 
     _llm_input_blocks = build_llm_input_blocks(intelligence_block, context_block, portfolio_ctx)
     logger.info(json.dumps({"event": "stage_guidance_complete", "has_portfolio": has_portfolio,
@@ -1437,6 +1451,7 @@ async def _build_guidance_stage(
         "has_any_docs": has_any_docs, "intent": intent,
         "intelligence_block": intelligence_block, "pipeline_confidence": pipeline_confidence,
         "_system_action": _system_action, "_llm_input_blocks": _llm_input_blocks,
+        "_skip_intelligence": _skip_intelligence,
     }
 
 
@@ -1447,14 +1462,17 @@ async def _build_prompt_stage(
     standalone_question: str, guidance: dict, retrieval: dict,
 ) -> list[dict]:
     """System prompt, user message, history summary → final stream_messages list."""
+    response_prompt = NATURAL_ADVISORY_PROMPT if not guidance.get('_skip_intelligence', False) else FACTUAL_HOLDINGS_PROMPT
+    # Omit profile block for factual queries to prevent advisory language leakage
+    profile_section = "" if guidance.get('_skip_intelligence', False) else guidance['profile_block']
     system_content = (
         f"CONTEXT_FLAGS:\n"
         f"HAS_CONTEXT={guidance['has_context']}\n"
         f"HAS_DOCUMENTS={guidance['has_any_docs']}\n"
         f"HAS_PORTFOLIO={guidance['has_portfolio']}\n"
         f"IS_NEW_SESSION={guidance['is_new_session']}\n\n"
-        f"{guidance['profile_block']}\n"
-        f"{CHAT_STREAM_PROMPT}"
+        f"{profile_section}"
+        f"{response_prompt}"
     )
     history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
     conversation_context = build_conversation_context(history_summary)
@@ -1734,6 +1752,7 @@ async def generate_stream_response(
         guidance = await _build_guidance_stage(
             pool, query, standalone_question,
             retrieval["context_block"], retrieval["sources"],
+            hybrid_plan=retrieval["hybrid_plan"],
         )
 
         # Stage 4 — prompt build
