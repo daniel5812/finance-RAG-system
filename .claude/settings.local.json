@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.py$\")",
+      "Read(//mnt/c/Users/daniel/Desktop/finance-RAG-system/.claude/worktrees/**)",
+      "Bash(python -m pytest backend/tests/test_portfolio_enrichment.py -v)",
+      "Bash(python -m pytest tests/test_portfolio_enrichment.py -v)"
+    ]
+  }
+}

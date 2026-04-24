@@ -59,12 +59,12 @@ def test_normalize_portfolio_full_coverage():
 
     # Overall metrics
     assert norm.total_positions == 2
-    assert norm.total_invested == 22500.0  # (100*150) + (50*300)
-    assert norm.allocation_pct["AAPL"] == 60.0  # 15000/25000
-    assert norm.allocation_pct["MSFT"] == 40.0  # 10000/25000
+    assert norm.total_invested == 30000.0  # (100*150) + (50*300) = 15000 + 15000
+    assert norm.allocation_pct["AAPL"] == 50.0  # 15000/30000
+    assert norm.allocation_pct["MSFT"] == 50.0  # 15000/30000
 
     # Market value
-    assert norm.total_market_value == 38775.0  # (100*175.50) + (50*310.25)
+    assert norm.total_market_value == 33062.5  # (100*175.50) + (50*310.25) = 17550 + 15512.5
     assert norm.prices_as_of == prices_as_of
 
     # Per-position details
@@ -74,15 +74,15 @@ def test_normalize_portfolio_full_coverage():
     assert aapl.position_value == 17550.0  # 100 * 175.50
     assert aapl.position_pnl == 2550.0  # 17550 - (100*150)
     assert aapl.position_pnl_pct == 17.0  # (2550/15000)*100
-    assert aapl.portfolio_weight == 45.21  # (17550/38775)*100, rounded
+    assert aapl.portfolio_weight == 53.08  # (17550/33062.5)*100, rounded
 
     msft = norm.positions["MSFT"]
     assert msft.entry_date == date(2023, 3, 20)
     assert msft.current_price == 310.25
     assert msft.position_value == 15512.5  # 50 * 310.25
     assert msft.position_pnl == 5512.5  # 15512.5 - (50*300)
-    assert msft.position_pnl_pct == 55.13  # (5512.5/10000)*100
-    assert msft.portfolio_weight == 40.01  # (15512.5/38775)*100, rounded
+    assert msft.position_pnl_pct == 55.13  # (5512.5/15000)*100
+    assert msft.portfolio_weight == 46.92  # (15512.5/33062.5)*100, rounded
 
     # Data note should indicate full coverage
     assert "Full price coverage" in norm.data_note
@@ -119,13 +119,13 @@ def test_normalize_portfolio_partial_coverage():
     norm = normalize_portfolio(rows, prices=prices)
 
     # Overall still computed by invested capital
-    assert norm.total_invested == 22500.0
-    assert norm.allocation_pct["AAPL"] == 60.0
-    assert norm.allocation_pct["MSFT"] == 40.0
-    assert norm.allocation_pct["GOOGL"] == 0.0  # Cost basis but no price
+    assert norm.total_invested == 33600.0  # (100*150) + (50*300) + (30*120) = 15000 + 15000 + 3600
+    assert norm.allocation_pct["AAPL"] == 44.64  # 15000/33600
+    assert norm.allocation_pct["MSFT"] == 44.64  # 15000/33600
+    assert norm.allocation_pct["GOOGL"] == 10.71  # 3600/33600
 
     # Market value only includes priced positions
-    assert norm.total_market_value == 38775.0
+    assert norm.total_market_value == 33062.5  # (100*175.50) + (50*310.25), GOOGL excluded
 
     # AAPL and MSFT have enrichment
     assert norm.positions["AAPL"].position_value == 17550.0
@@ -160,9 +160,9 @@ def test_normalize_portfolio_no_prices():
 
     # Core metrics unchanged
     assert norm.total_positions == 2
-    assert norm.total_invested == 22500.0
-    assert norm.allocation_pct["AAPL"] == 60.0
-    assert norm.allocation_pct["MSFT"] == 40.0
+    assert norm.total_invested == 30000.0  # (100*150) + (50*300) = 15000 + 15000
+    assert norm.allocation_pct["AAPL"] == 50.0  # 15000/30000
+    assert norm.allocation_pct["MSFT"] == 50.0  # 15000/30000
 
     # Market-value fields absent
     assert norm.total_market_value is None

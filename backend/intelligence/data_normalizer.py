@@ -115,6 +115,10 @@ def _compute(
     if total_invested > 0:
         for ticker, v in by_ticker.items():
             allocation_pct[ticker] = round(v["total_invested"] / total_invested * 100, 2)
+    else:
+        # If total_invested is 0, all positions have 0% allocation
+        for ticker in by_ticker.keys():
+            allocation_pct[ticker] = 0.0
 
     # Sort descending by allocation
     allocation_pct = dict(
