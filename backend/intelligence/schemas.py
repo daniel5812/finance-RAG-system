@@ -288,5 +288,6 @@ class IntelligenceReport(BaseModel):
             not self.user_profile
             and not self.market_context
             and not self.asset_profiles
+            and not self.normalized_portfolio
             and not self.recommendations
         )

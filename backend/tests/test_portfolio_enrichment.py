@@ -80,8 +80,8 @@ def test_normalize_portfolio_full_coverage():
     assert msft.entry_date == date(2023, 3, 20)
     assert msft.current_price == 310.25
     assert msft.position_value == 15512.5  # 50 * 310.25
-    assert msft.position_pnl == 5512.5  # 15512.5 - (50*300)
-    assert msft.position_pnl_pct == 55.13  # (5512.5/15000)*100
+    assert msft.position_pnl == 512.5  # 15512.5 - (50*300)
+    assert msft.position_pnl_pct == 3.42  # (512.5/15000)*100
     assert msft.portfolio_weight == 46.92  # (15512.5/33062.5)*100, rounded
 
     # Data note should indicate full coverage
