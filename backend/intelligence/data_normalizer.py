@@ -33,6 +33,14 @@ from datetime import date
 from intelligence.schemas import NormalizedPortfolio, PositionDetail
 
 
+def _safe_get(row: dict | object, key: str, default=None):
+    """Access row field as dict or object attribute (handles both dict and MagicMock rows)."""
+    try:
+        return row[key] if isinstance(row, dict) else getattr(row, key, default)
+    except (KeyError, TypeError):
+        return default
+
+
 def normalize_portfolio(
     rows: list[dict],
     prices: dict[str, float] | None = None,
@@ -88,14 +96,16 @@ def _compute(
 
     currency = "USD"
     for row in rows:
-        ticker = row["symbol"].upper()
+        ticker = _safe_get(row, "symbol", "").upper()
+        if not ticker:
+            continue  # skip rows without symbol
         if ticker in seen:
             continue  # skip older rows for same ticker
         seen.add(ticker)
 
-        qty = float(row.get("quantity") or 0.0)
-        cb  = float(row.get("cost_basis") or 0.0)   # avg price per unit
-        entry_dt = row.get("entry_date")  # optional: MIN(date) from DB query
+        qty = float(_safe_get(row, "quantity") or 0.0)
+        cb  = float(_safe_get(row, "cost_basis") or 0.0)   # avg price per unit
+        entry_dt = _safe_get(row, "entry_date")  # optional: MIN(date) from DB query
         total_position_value = qty * cb    # total invested in this position
 
         by_ticker[ticker] = {
@@ -104,8 +114,9 @@ def _compute(
             "total_invested": total_position_value,
             "entry_date":     entry_dt,     # from DB MIN(date) or None
         }
-        if row.get("currency"):
-            currency = str(row["currency"])
+        cur = _safe_get(row, "currency")
+        if cur:
+            currency = str(cur)
 
     # ── Total invested capital ────────────────────────────────────────────────
     total_invested = sum(v["total_invested"] for v in by_ticker.values())

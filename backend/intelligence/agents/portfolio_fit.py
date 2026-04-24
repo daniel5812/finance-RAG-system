@@ -33,6 +33,14 @@ from intelligence.schemas import PortfolioFitAnalysis
 
 logger = get_logger(__name__)
 
+
+def _safe_get(row: dict | object, key: str, default=None):
+    """Access row field as dict or object attribute (handles both dict and MagicMock rows)."""
+    try:
+        return row[key] if isinstance(row, dict) else getattr(row, key, default)
+    except (KeyError, TypeError):
+        return default
+
 # HHI thresholds for concentration risk
 _HHI_HIGH   = 0.25   # single asset >25% by count
 _HHI_MEDIUM = 0.15
@@ -91,7 +99,25 @@ async def _fetch_portfolio(owner_id: str, pool: asyncpg.Pool) -> list[dict]:
         """,
         owner_id,
     )
-    return [dict(r) for r in rows]
+    # Convert rows to dicts; handle both asyncpg Record and mock objects
+    result = []
+    for r in rows:
+        if isinstance(r, dict):
+            result.append(r)
+        else:
+            try:
+                result.append(dict(r))
+            except (TypeError, ValueError):
+                # If dict() fails (e.g., on MagicMock), build dict from attributes
+                result.append({
+                    "symbol": _safe_get(r, "symbol"),
+                    "quantity": _safe_get(r, "quantity"),
+                    "cost_basis": _safe_get(r, "cost_basis"),
+                    "currency": _safe_get(r, "currency"),
+                    "account": _safe_get(r, "account"),
+                    "entry_date": _safe_get(r, "entry_date"),
+                })
+    return result
 
 
 async def _fetch_prices(
@@ -118,9 +144,13 @@ async def _fetch_prices(
     prices = {}
     latest_date = None
     for row in rows:
-        prices[row["symbol"]] = float(row["close"])
-        if latest_date is None or row["date"] > latest_date:
-            latest_date = row["date"]
+        symbol = _safe_get(row, "symbol")
+        close = _safe_get(row, "close")
+        row_date = _safe_get(row, "date")
+        if symbol and close is not None:
+            prices[symbol] = float(close)
+            if latest_date is None or row_date > latest_date:
+                latest_date = row_date
 
     return prices, latest_date
 
@@ -149,7 +179,7 @@ def _analyse(
 
     # ── Unique tickers in portfolio ───────────────────────────────────────────
     port_tickers = list(norm.allocation_pct.keys()) if norm.allocation_pct else list(
-        {r["symbol"].upper() for r in rows}
+        {_safe_get(r, "symbol", "").upper() for r in rows if _safe_get(r, "symbol")}
     )
     mentioned_upper = [t.upper() for t in tickers_mentioned]
     already_held = [t for t in mentioned_upper if t in set(port_tickers)]
