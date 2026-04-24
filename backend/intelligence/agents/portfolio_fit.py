@@ -22,6 +22,9 @@ Design:
 
 from __future__ import annotations
 
+from datetime import date
+from typing import Optional
+
 import asyncpg
 
 from core.logger import get_logger
@@ -57,7 +60,10 @@ class PortfolioFitAgent:
 
         try:
             rows = await _fetch_portfolio(owner_id, pool)
-            return _analyse(rows, tickers_mentioned)
+            # Extract unique symbols and fetch prices
+            symbols = list({r["symbol"].upper() for r in rows}) if rows else []
+            prices, prices_as_of = await _fetch_prices(symbols, pool)
+            return _analyse(rows, tickers_mentioned, prices=prices, prices_as_of=prices_as_of)
         except Exception as exc:
             logger.warning(
                 f'{{"event": "portfolio_fit_agent", "owner_id": "REDACTED", '
@@ -76,7 +82,8 @@ class PortfolioFitAgent:
 async def _fetch_portfolio(owner_id: str, pool: asyncpg.Pool) -> list[dict]:
     rows = await pool.fetch(
         """
-        SELECT symbol, quantity, cost_basis, currency, account
+        SELECT symbol, quantity, cost_basis, currency, account,
+               MIN(date) OVER (PARTITION BY symbol) AS entry_date
         FROM portfolio_positions
         WHERE user_id = $1
         ORDER BY date DESC
@@ -87,11 +94,47 @@ async def _fetch_portfolio(owner_id: str, pool: asyncpg.Pool) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def _fetch_prices(
+    symbols: list[str], pool: asyncpg.Pool
+) -> tuple[dict[str, float], Optional[date]]:
+    """
+    Fetch latest price for each symbol from prices table.
+    Returns (prices_dict, prices_as_of_date).
+    If no symbols or no prices found, returns ({}, None).
+    """
+    if not symbols:
+        return {}, None
+
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT ON (symbol) symbol, close, date
+        FROM prices
+        WHERE symbol = ANY($1)
+        ORDER BY symbol, date DESC
+        """,
+        symbols,
+    )
+
+    prices = {}
+    latest_date = None
+    for row in rows:
+        prices[row["symbol"]] = float(row["close"])
+        if latest_date is None or row["date"] > latest_date:
+            latest_date = row["date"]
+
+    return prices, latest_date
+
+
 # ─────────────────────────────────────────────────────────────
 # Analysis
 # ─────────────────────────────────────────────────────────────
 
-def _analyse(rows: list[dict], tickers_mentioned: list[str]) -> PortfolioFitAnalysis:
+def _analyse(
+    rows: list[dict],
+    tickers_mentioned: list[str],
+    prices: dict[str, float] | None = None,
+    prices_as_of: Optional[date] = None,
+) -> PortfolioFitAnalysis:
     if not rows:
         return PortfolioFitAnalysis(
             tickers_mentioned=tickers_mentioned,
@@ -101,7 +144,8 @@ def _analyse(rows: list[dict], tickers_mentioned: list[str]) -> PortfolioFitAnal
 
     # ── Normalize portfolio (compute invested capital per ticker) ─────────────
     # normalize_portfolio deduplicates by ticker (takes newest row per ticker)
-    norm = normalize_portfolio(rows)
+    # If prices provided, also computes position values, P&L, and portfolio weights
+    norm = normalize_portfolio(rows, prices=prices, prices_as_of=prices_as_of)
 
     # ── Unique tickers in portfolio ───────────────────────────────────────────
     port_tickers = list(norm.allocation_pct.keys()) if norm.allocation_pct else list(

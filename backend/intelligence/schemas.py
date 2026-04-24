@@ -12,6 +12,7 @@ Design rules:
 
 from __future__ import annotations
 
+from datetime import date
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -117,6 +118,23 @@ class AssetScore(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────
+# Per-Position Enrichment (computed from prices and cost_basis)
+# ─────────────────────────────────────────────────────────────
+
+class PositionDetail(BaseModel):
+    """
+    Deterministically computed enrichment for a single position.
+    All fields are optional — missing prices → null fields (never zero or synthetic values).
+    """
+    entry_date: Optional[date] = None
+    current_price: Optional[float] = None
+    position_value: Optional[float] = None      # qty × current_price
+    position_pnl: Optional[float] = None        # position_value − qty × cost_basis
+    position_pnl_pct: Optional[float] = None    # (pnl / invested_value) × 100
+    portfolio_weight: Optional[float] = None    # (position_value / total_market_value) × 100
+
+
+# ─────────────────────────────────────────────────────────────
 # Data Normalization Layer output
 # ─────────────────────────────────────────────────────────────
 
@@ -127,6 +145,11 @@ class NormalizedPortfolio(BaseModel):
 
     Schema note: cost_basis = avg price paid per unit (per schema.sql comment).
     total_invested = SUM(quantity × cost_basis) per position.
+
+    Enrichment fields (all optional, computed when prices are available):
+      - positions: dict[str, PositionDetail] — per-position market metrics
+      - total_market_value: total position_value across all positions with known prices
+      - prices_as_of: staleness indicator — date of most recent price lookup
     """
     total_positions: int = 0
     total_invested: Optional[float] = None          # SUM(quantity × cost_basis) — total capital deployed
@@ -134,6 +157,12 @@ class NormalizedPortfolio(BaseModel):
     largest_position_ticker: Optional[str] = None
     largest_position_pct: Optional[float] = None    # % of total_invested
     currency: str = "USD"
+
+    # Enrichment fields (NEW)
+    positions: dict[str, PositionDetail] = Field(default_factory=dict)  # ticker → computed detail
+    total_market_value: Optional[float] = None      # SUM(qty × price) — total market value
+    prices_as_of: Optional[date] = None             # staleness label
+
     data_note: str = (
         "Allocation % is based on cost_basis × quantity (invested capital). "
         "Current market value and P&L are NOT available without live prices."
