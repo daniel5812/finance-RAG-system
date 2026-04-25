@@ -99,24 +99,32 @@ async def _fetch_portfolio(owner_id: str, pool: asyncpg.Pool) -> list[dict]:
         """,
         owner_id,
     )
-    # Convert rows to dicts; handle both asyncpg Record and mock objects
+    # Convert rows to dicts; handle asyncpg Record, plain dict, and mock objects.
+    # NOTE: dict(MagicMock) returns {} without raising — must validate the result.
     result = []
     for r in rows:
         if isinstance(r, dict):
             result.append(r)
+            continue
+        # Try dict() first (works for asyncpg.Record)
+        d = None
+        try:
+            d = dict(r)
+        except Exception:
+            pass
+        # Validate dict() produced real data — empty dict means MagicMock/bad row
+        if d and isinstance(d.get("symbol"), str):
+            result.append(d)
         else:
-            try:
-                result.append(dict(r))
-            except (TypeError, ValueError):
-                # If dict() fails (e.g., on MagicMock), build dict from attributes
-                result.append({
-                    "symbol": _safe_get(r, "symbol"),
-                    "quantity": _safe_get(r, "quantity"),
-                    "cost_basis": _safe_get(r, "cost_basis"),
-                    "currency": _safe_get(r, "currency"),
-                    "account": _safe_get(r, "account"),
-                    "entry_date": _safe_get(r, "entry_date"),
-                })
+            # Attribute access fallback for MagicMock and object-style rows
+            result.append({
+                "symbol": _safe_get(r, "symbol"),
+                "quantity": _safe_get(r, "quantity"),
+                "cost_basis": _safe_get(r, "cost_basis"),
+                "currency": _safe_get(r, "currency"),
+                "account": _safe_get(r, "account"),
+                "entry_date": _safe_get(r, "entry_date"),
+            })
     return result
 
 

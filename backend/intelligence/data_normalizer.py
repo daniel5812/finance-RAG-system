@@ -180,14 +180,15 @@ def _compute(
                 position_value = qty * price
                 detail.position_value = round(position_value, 2)
 
-                # PnL only if cost_basis is valid (non-zero)
+                # PnL only if cost_basis is valid (non-zero) and invested > 0
                 if cb and cb > 0:
                     invested_amt = qty * cb
                     pnl = position_value - invested_amt
                     detail.position_pnl = round(pnl, 2)
 
-                    pnl_pct = (pnl / invested_amt) * 100
-                    detail.position_pnl_pct = round(pnl_pct, 2)
+                    if invested_amt != 0:  # guard: qty=0 makes invested_amt=0
+                        pnl_pct = (pnl / invested_amt) * 100
+                        detail.position_pnl_pct = round(pnl_pct, 2)
 
                 # portfolio_weight only if total_market_value available
                 if total_market_value and total_market_value > 0:
