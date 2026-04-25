@@ -197,6 +197,51 @@ def _compute(
 
             positions_detail[ticker] = detail
 
+    # ── Step 2: Derived Metrics ──────────────────────────────────────────────
+    # Compute concentration_score, diversification_score, sector_exposure_pct
+    concentration_score: float | None = None
+    diversification_score: float | None = None
+    sector_exposure_pct: dict[str, float] | None = None
+
+    # Concentration score (HHI) — use market value weights if ALL available, else cost-basis
+    # Only use portfolio_weight if all positions have prices (full coverage)
+    if total_market_value and total_market_value > 0 and price_count == len(by_ticker):
+        # All positions priced: use portfolio_weight from PositionDetail (market-value basis)
+        weights = [d.portfolio_weight / 100 for d in positions_detail.values()]
+    else:
+        # Partial or no prices: fall back to cost-basis allocation
+        weights = [pct / 100 for pct in allocation_pct.values()]
+
+    if weights:
+        concentration_score = round(sum(w ** 2 for w in weights), 6)
+        n = len(weights)
+        if n == 1:
+            diversification_score = 0.0
+        elif n > 1:
+            min_hhi = 1 / n
+            raw_diversification = 1 - (concentration_score - min_hhi) / (1 - min_hhi)
+            # Clamp to [0, 1] to handle floating point precision
+            diversification_score = round(max(0.0, min(1.0, raw_diversification)), 6)
+
+    # Sector exposure — group by sector field in original rows
+    has_sector_data = any(_safe_get(row, "sector") for row in rows)
+    if has_sector_data and (total_market_value and total_market_value > 0):
+        sector_totals: dict[str, float] = {}
+        for ticker, detail in positions_detail.items():
+            if detail.portfolio_weight is not None:
+                # Find sector for this ticker from original rows
+                sector = None
+                for row in rows:
+                    if _safe_get(row, "symbol", "").upper() == ticker:
+                        sector = _safe_get(row, "sector") or "Unknown"
+                        break
+                if sector is None:
+                    sector = "Unknown"
+                sector_totals[sector] = sector_totals.get(sector, 0.0) + detail.portfolio_weight
+
+        if sector_totals:
+            sector_exposure_pct = {k: round(v, 2) for k, v in sorted(sector_totals.items())}
+
     # ── Build data_note based on price coverage ──────────────────────────────
     if prices:
         if price_count == len(by_ticker):
@@ -232,5 +277,8 @@ def _compute(
         positions=positions_detail,
         total_market_value=round(total_market_value, 2) if total_market_value else None,
         prices_as_of=prices_as_of,
+        concentration_score=concentration_score,
+        diversification_score=diversification_score,
+        sector_exposure_pct=sector_exposure_pct,
         data_note=data_note,
     )
