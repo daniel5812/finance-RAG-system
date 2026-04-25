@@ -71,7 +71,7 @@ def test_benchmark_comparison_full_spy_coverage():
     norm = _normalized_portfolio(portfolio_alloc, positions_detail=positions)
     portfolio_hhi = 0.52  # (0.6)^2 + (0.4)^2 = 0.36 + 0.16
 
-    # SPY holdings: 9 tickers, coverage ~95% (sum > 80%)
+    # SPY holdings: 15 tickers, total coverage ≥ 80% (sum = 80.0)
     spy_holdings = [
         _holding("AAPL", 7.2),
         _holding("MSFT", 6.8),
@@ -82,9 +82,15 @@ def test_benchmark_comparison_full_spy_coverage():
         _holding("TSLA", 3.2),
         _holding("JPM", 3.1),
         _holding("V", 2.9),
-    ]
+        _holding("JNJ", 2.8),
+        _holding("WMT", 2.7),
+        _holding("PG", 2.6),
+        _holding("XOM", 2.5),
+        _holding("BAC", 2.4),
+        _holding("CVX", 2.3),
+    ]  # Total: 80.0%
 
-    # QQQ holdings: top 3 tech, coverage ~85%
+    # QQQ holdings: tech, coverage ≥ 80% (sum = 82.0)
     qqq_holdings = [
         _holding("AAPL", 8.1),
         _holding("MSFT", 7.8),
@@ -100,27 +106,26 @@ def test_benchmark_comparison_full_spy_coverage():
         _holding("ORCL", 2.7),
         _holding("CSCO", 2.4),
         _holding("QCOM", 2.2),
-        _holding("TXN", 1.8),
-    ]
+    ]  # Total: 82.0%
 
     bc = BenchmarkComparisonAgent.run(norm, portfolio_hhi, spy_holdings, qqq_holdings)
 
     # Check SPY snapshot
     spy = next((s for s in bc.benchmarks if s.symbol == "SPY"), None)
     assert spy is not None
-    assert spy.hhi is not None  # HHI computed
+    assert spy.hhi is not None  # HHI computed (coverage ≥ 80%)
     assert spy.coverage_pct >= 80.0
-    assert spy.holding_count == 9
+    assert spy.holding_count == 15
     assert spy.top_sectors == _SPY_SECTOR_WEIGHTS  # static dict
 
     # Check QQQ snapshot
     qqq = next((s for s in bc.benchmarks if s.symbol == "QQQ"), None)
     assert qqq is not None
-    assert qqq.hhi is not None  # HHI computed
+    assert qqq.hhi is not None  # HHI computed (coverage ≥ 80%)
     assert qqq.coverage_pct >= 80.0
-    assert qqq.holding_count == 15
+    assert qqq.holding_count == 14
 
-    # Concentration labels set (HHI > SPY's and QQQ's)
+    # Concentration labels set (both HHIs present)
     assert bc.concentration_vs_spy is not None
     assert bc.concentration_vs_qqq is not None
 
@@ -135,17 +140,18 @@ def test_concentration_labels():
     norm = _normalized_portfolio(portfolio_alloc)
     portfolio_hhi = 1.0
 
-    # SPY HHI ~0.012, delta = 1.0 - 0.012 = 0.988 >> 0.05 threshold
-    spy_holdings = [_holding(f"TICK{i}", 1.0 / 11.0) for i in range(11)]  # equal weight
+    # SPY: 11 equal holdings at ~9.09% each = 100% coverage ≥ 80% → HHI computed
+    # HHI = 11 * (1/11)^2 = 11 * (0.0909)^2 ≈ 0.0909
+    spy_holdings = [_holding(f"TICK{i}", 100.0 / 11.0) for i in range(11)]
 
-    # Empty QQQ
+    # Empty QQQ (0% coverage < 80% → HHI suppressed)
     qqq_holdings = []
 
     bc = BenchmarkComparisonAgent.run(norm, portfolio_hhi, spy_holdings, qqq_holdings)
 
-    # With 11 equal holdings SPY HHI ~0.0091
+    # Portfolio HHI (1.0) >> SPY HHI (~0.0909) → more_concentrated
     assert bc.concentration_vs_spy == "more_concentrated"
-    assert bc.concentration_vs_qqq is None  # QQQ HHI is None
+    assert bc.concentration_vs_qqq is None  # QQQ HHI is None (coverage < 80%)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,7 +229,7 @@ def test_weight_basis_cost_basis():
     bc = BenchmarkComparisonAgent.run(norm, portfolio_hhi, [], [])
 
     assert bc.weight_basis == "cost_basis"
-    assert "cost-basis weights" in (bc.data_note or "")
+    assert "cost-basis based" in (bc.data_note or "")
 
 
 def test_weight_basis_mixed():
@@ -511,11 +517,11 @@ async def test_fetch_benchmark_holdings_mock():
 
     from financial.crud import fetch_benchmark_holdings
 
-    # Mock the pool.fetch call
+    # Mock the pool.fetch call to return plain dicts
     mock_pool = AsyncMock()
     mock_pool.fetch = AsyncMock(return_value=[
-        MagicMock(holding_symbol="AAPL", weight=7.2),
-        MagicMock(holding_symbol="MSFT", weight=6.8),
+        {"holding_symbol": "AAPL", "weight": 7.2},
+        {"holding_symbol": "MSFT", "weight": 6.8},
     ])
 
     result = await fetch_benchmark_holdings(mock_pool, "SPY")
@@ -565,7 +571,7 @@ def test_real_world_concentrated_tech_portfolio():
     #              = 0.1225 + 0.09 + 0.0225 + 0.01 + 0.0025 + 0.0025 = 0.25
     portfolio_hhi = 0.25
 
-    # SPY: broad market
+    # SPY: broad market, ≥80% coverage for HHI computation
     spy_holdings = [
         _holding("AAPL", 7.2),
         _holding("MSFT", 6.8),
@@ -577,9 +583,16 @@ def test_real_world_concentrated_tech_portfolio():
         _holding("JPM", 3.1),
         _holding("JNJ", 2.8),
         _holding("V", 2.9),
-    ]
+        _holding("WMT", 2.7),
+        _holding("PG", 2.6),
+        _holding("XOM", 2.5),
+        _holding("BAC", 2.4),
+        _holding("CVX", 2.3),
+        _holding("MCD", 2.2),
+        _holding("NKE", 2.1),
+    ]  # Total: 80.1%
 
-    # QQQ: tech-heavy
+    # QQQ: tech-heavy, ≥80% coverage for HHI computation
     qqq_holdings = [
         _holding("AAPL", 8.1),
         _holding("MSFT", 7.8),
@@ -588,7 +601,14 @@ def test_real_world_concentrated_tech_portfolio():
         _holding("META", 5.5),
         _holding("TSLA", 5.2),
         _holding("AMZN", 4.8),
-    ]
+        _holding("AMD", 4.1),
+        _holding("CRM", 3.8),
+        _holding("ADBE", 3.2),
+        _holding("INTC", 2.9),
+        _holding("ORCL", 2.7),
+        _holding("CSCO", 2.4),
+        _holding("QCOM", 2.2),
+    ]  # Total: 82.0%
 
     bc = BenchmarkComparisonAgent.run(norm, portfolio_hhi, spy_holdings, qqq_holdings)
 
