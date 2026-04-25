@@ -19,6 +19,7 @@ Design:
 from __future__ import annotations
 
 from intelligence.schemas import (
+    BenchmarkComparison,
     IntelligenceReport, NormalizedPortfolio, PortfolioGapAnalysis,
     RecommendationAction, ValidationResult,
 )
@@ -153,6 +154,13 @@ def build_intelligence_context(report: IntelligenceReport) -> str:
     if report.portfolio_gap_analysis:
         sections.append(_DIVIDER)
         sections.append(_render_gap_analysis(report.portfolio_gap_analysis))
+
+    # ── Benchmark Comparison (Step 3) ────────────────────────────────────────
+    if report.benchmark_comparison:
+        rendered = _render_benchmark_comparison(report.benchmark_comparison)
+        if rendered:
+            sections.append(_DIVIDER)
+            sections.append(rendered)
 
     # ── Portfolio Fit ───────────────────────────────────────────────────────
     if report.portfolio_fit:
@@ -320,6 +328,88 @@ def _render_gap_analysis(gap: PortfolioGapAnalysis) -> str:
     lines.append("  Suggested directions:")
     for d in gap.suggested_directions:
         lines.append(f"    → {d}")
+
+    return "\n".join(lines)
+
+
+def _render_benchmark_comparison(bc: BenchmarkComparison) -> str:
+    """
+    Render BenchmarkComparison for LLM consumption.
+    All values are pre-computed — the LLM MUST NOT recalculate them.
+    Returns empty string when no meaningful data is present.
+    """
+    has_data = (
+        bc.portfolio_hhi is not None
+        or bc.concentration_vs_spy is not None
+        or bc.concentration_vs_qqq is not None
+        or bc.overweight_vs_spy
+        or bc.underweight_vs_spy
+        or bc.portfolio_overlap_spy_pct is not None
+        or bc.portfolio_overlap_qqq_pct is not None
+    )
+    if not has_data:
+        return ""
+
+    basis_label = {
+        "market_value": "market-value weights",
+        "cost_basis": "cost-basis weights (market prices unavailable)",
+        "mixed": "mixed weights (market-value where available, cost-basis otherwise)",
+    }.get(bc.weight_basis, bc.weight_basis)
+
+    lines = [
+        f"[BENCHMARK COMPARISON — pre-computed, DO NOT recalculate]",
+        f"  Portfolio HHI: {bc.portfolio_hhi:.4f}  |  Weight basis: {basis_label}",
+    ]
+
+    for snap in bc.benchmarks:
+        lines.append("")
+        hhi_str = f"{snap.hhi:.4f}" if snap.hhi is not None else "N/A"
+        count_str = f"{snap.holding_count} holdings" if snap.holding_count else "unknown holdings"
+        cov_str = f"{snap.coverage_pct:.0f}% coverage" if snap.coverage_pct is not None else ""
+        lines.append(f"  vs {snap.symbol} ({count_str}{', ' + cov_str if cov_str else ''}):")
+        lines.append(f"    HHI: {hhi_str}")
+
+        if snap.symbol == "SPY":
+            conc = bc.concentration_vs_spy
+            overlap = bc.portfolio_overlap_spy_pct
+        else:
+            conc = bc.concentration_vs_qqq
+            overlap = bc.portfolio_overlap_qqq_pct
+
+        if conc:
+            delta_str = ""
+            if bc.portfolio_hhi is not None and snap.hhi is not None:
+                delta = bc.portfolio_hhi - snap.hhi
+                delta_str = f" (Δ{delta:+.4f})"
+            label = conc.replace("_", " ").upper()
+            lines.append(f"    Concentration: {label}{delta_str}")
+
+        if overlap is not None:
+            lines.append(f"    Portfolio overlap: {overlap:.1f}% of portfolio weight held in {snap.symbol}")
+
+        if snap.top_sectors:
+            top = list(snap.top_sectors.items())[:5]
+            sector_parts = ", ".join(f"{s}: {w:.1f}%" for s, w in top)
+            lines.append(f"    Top sectors: {sector_parts}")
+
+        if snap.data_note:
+            lines.append(f"    ⚠ {snap.data_note}")
+
+    if bc.overweight_vs_spy:
+        lines.append("")
+        lines.append("  Overweight vs SPY (top positions):")
+        for entry in bc.overweight_vs_spy:
+            lines.append(f"    ▲ {entry}")
+
+    if bc.underweight_vs_spy:
+        lines.append("")
+        lines.append("  Underweight vs SPY (top positions):")
+        for entry in bc.underweight_vs_spy:
+            lines.append(f"    ▼ {entry}")
+
+    if bc.data_note:
+        lines.append("")
+        lines.append(f"  ⚠ {bc.data_note}")
 
     return "\n".join(lines)
 

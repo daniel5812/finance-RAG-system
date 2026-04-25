@@ -29,89 +29,9 @@ from __future__ import annotations
 
 from core.logger import get_logger
 from intelligence.schemas import NormalizedPortfolio, PortfolioGapAnalysis, SectorWeight
+from intelligence.static_data import _ASSET_CLASSES, _SECTOR_MAP, _SPY_SECTOR_WEIGHTS
 
 logger = get_logger(__name__)
-
-# ── SPY sector weights (approximate, as of 2025) ──────────────────────────────
-# Source: SPDR portfolio composition, major sector ETFs
-_SPY_SECTOR_WEIGHTS: dict[str, float] = {
-    "Technology":              31.0,
-    "Financials":              13.0,
-    "Healthcare":              12.5,
-    "Consumer Discretionary":  10.5,
-    "Industrials":              8.5,
-    "Communication Services":   8.0,
-    "Consumer Staples":         5.5,
-    "Energy":                   4.0,
-    "Materials":                2.5,
-    "Real Estate":              2.5,
-    "Utilities":                2.0,
-}
-
-# ── Asset class membership ────────────────────────────────────────────────────
-# Maps asset class name → set of sector strings that qualify
-_ASSET_CLASSES: dict[str, set[str]] = {
-    "US Equities": {
-        "Technology", "Financials", "Healthcare", "Consumer Discretionary",
-        "Industrials", "Communication Services", "Consumer Staples", "Energy",
-        "Materials", "Utilities", "Real Estate",
-        "US Broad Market", "US Total Market", "US Large Cap", "US Small Cap",
-        "Technology Heavy",
-    },
-    "International Equities": {
-        "International Developed", "Emerging Markets",
-    },
-    "Fixed Income": {
-        "US Bond Market", "Long-Term Bonds", "Short-Term Bonds",
-        "Intermediate Bonds", "Investment Grade Bonds", "High Yield Bonds",
-        "Emerging Market Bonds",
-    },
-    "Commodities": {"Commodities"},
-    "Real Estate": {"Real Estate"},
-}
-
-# Static sector map — mirrors asset_profiler.py for consistency
-_SECTOR_MAP: dict[str, str] = {
-    "AAPL": "Technology", "MSFT": "Technology", "GOOGL": "Technology",
-    "GOOG": "Technology", "META": "Technology", "NVDA": "Technology",
-    "AMD": "Technology", "INTC": "Technology", "CRM": "Technology",
-    "ORCL": "Technology", "CSCO": "Technology", "ADBE": "Technology",
-    "QCOM": "Technology", "TXN": "Technology", "AVGO": "Technology",
-    "AMZN": "Consumer Discretionary", "TSLA": "Consumer Discretionary",
-    "NKE": "Consumer Discretionary", "HD": "Consumer Discretionary",
-    "MCD": "Consumer Discretionary", "SBUX": "Consumer Discretionary",
-    "JPM": "Financials", "GS": "Financials", "BAC": "Financials",
-    "WFC": "Financials", "V": "Financials", "MA": "Financials",
-    "MS": "Financials", "C": "Financials", "BLK": "Financials",
-    "JNJ": "Healthcare", "PFE": "Healthcare", "MRK": "Healthcare",
-    "ABBV": "Healthcare", "LLY": "Healthcare", "UNH": "Healthcare",
-    "BMY": "Healthcare", "AMGN": "Healthcare", "GILD": "Healthcare",
-    "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
-    "SLB": "Energy", "EOG": "Energy",
-    "PG": "Consumer Staples", "KO": "Consumer Staples", "PEP": "Consumer Staples",
-    "WMT": "Consumer Staples", "COST": "Consumer Staples", "PM": "Consumer Staples",
-    "NFLX": "Communication Services", "DIS": "Communication Services",
-    "T": "Communication Services", "VZ": "Communication Services",
-    "BA": "Industrials", "CAT": "Industrials", "GE": "Industrials",
-    "RTX": "Industrials", "HON": "Industrials", "UPS": "Industrials",
-    "LIN": "Materials", "APD": "Materials", "NEM": "Materials",
-    "NEE": "Utilities", "DUK": "Utilities", "SO": "Utilities",
-    "AMT": "Real Estate", "PLD": "Real Estate", "CCI": "Real Estate",
-    "GLD": "Commodities", "SLV": "Commodities", "USO": "Commodities",
-    "XLK": "Technology", "XLF": "Financials", "XLE": "Energy",
-    "XLV": "Healthcare", "XLU": "Utilities", "XLB": "Materials",
-    "XLC": "Communication Services", "XLI": "Industrials", "XLRE": "Real Estate",
-    "SPY": "US Broad Market", "IVV": "US Broad Market", "VOO": "US Broad Market",
-    "VTI": "US Total Market", "QQQ": "Technology Heavy",
-    "IWM": "US Small Cap", "DIA": "US Large Cap",
-    "VEA": "International Developed", "IEFA": "International Developed",
-    "VWO": "Emerging Markets", "EEM": "Emerging Markets",
-    "VNQ": "Real Estate",
-    "AGG": "US Bond Market", "BND": "US Bond Market",
-    "TLT": "Long-Term Bonds", "SHY": "Short-Term Bonds", "IEF": "Intermediate Bonds",
-    "HYG": "High Yield Bonds", "LQD": "Investment Grade Bonds",
-    "EMB": "Emerging Market Bonds",
-}
 
 # Thresholds for over/underweight classification
 _OVERWEIGHT_THRESHOLD  =  10.0   # > 10pp above benchmark → overweight
