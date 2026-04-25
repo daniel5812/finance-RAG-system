@@ -203,16 +203,13 @@ def _compute(
     diversification_score: float | None = None
     sector_exposure_pct: dict[str, float] | None = None
 
-    # Concentration score (HHI) — use market value weights if available, else cost-basis
-    if total_market_value and total_market_value > 0 and price_count > 0:
-        # Use portfolio_weight from PositionDetail (market-value basis)
-        weights = [
-            d.portfolio_weight / 100
-            for d in positions_detail.values()
-            if d.portfolio_weight is not None
-        ]
+    # Concentration score (HHI) — use market value weights if ALL available, else cost-basis
+    # Only use portfolio_weight if all positions have prices (full coverage)
+    if total_market_value and total_market_value > 0 and price_count == len(by_ticker):
+        # All positions priced: use portfolio_weight from PositionDetail (market-value basis)
+        weights = [d.portfolio_weight / 100 for d in positions_detail.values()]
     else:
-        # Fall back to cost-basis allocation
+        # Partial or no prices: fall back to cost-basis allocation
         weights = [pct / 100 for pct in allocation_pct.values()]
 
     if weights:
@@ -222,9 +219,9 @@ def _compute(
             diversification_score = 0.0
         elif n > 1:
             min_hhi = 1 / n
-            diversification_score = round(
-                1 - (concentration_score - min_hhi) / (1 - min_hhi), 6
-            )
+            raw_diversification = 1 - (concentration_score - min_hhi) / (1 - min_hhi)
+            # Clamp to [0, 1] to handle floating point precision
+            diversification_score = round(max(0.0, min(1.0, raw_diversification)), 6)
 
     # Sector exposure — group by sector field in original rows
     has_sector_data = any(_safe_get(row, "sector") for row in rows)
