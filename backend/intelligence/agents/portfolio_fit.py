@@ -22,6 +22,9 @@ Design:
 
 from __future__ import annotations
 
+from datetime import date
+from typing import Optional
+
 import asyncpg
 
 from core.logger import get_logger
@@ -29,6 +32,14 @@ from intelligence.data_normalizer import normalize_portfolio
 from intelligence.schemas import PortfolioFitAnalysis
 
 logger = get_logger(__name__)
+
+
+def _safe_get(row: dict | object, key: str, default=None):
+    """Access row field as dict or object attribute (handles both dict and MagicMock rows)."""
+    try:
+        return row[key] if isinstance(row, dict) else getattr(row, key, default)
+    except (KeyError, TypeError):
+        return default
 
 # HHI thresholds for concentration risk
 _HHI_HIGH   = 0.25   # single asset >25% by count
@@ -57,7 +68,10 @@ class PortfolioFitAgent:
 
         try:
             rows = await _fetch_portfolio(owner_id, pool)
-            return _analyse(rows, tickers_mentioned)
+            # Extract unique symbols and fetch prices
+            symbols = list({r["symbol"].upper() for r in rows}) if rows else []
+            prices, prices_as_of = await _fetch_prices(symbols, pool)
+            return _analyse(rows, tickers_mentioned, prices=prices, prices_as_of=prices_as_of)
         except Exception as exc:
             logger.warning(
                 f'{{"event": "portfolio_fit_agent", "owner_id": "REDACTED", '
@@ -76,7 +90,8 @@ class PortfolioFitAgent:
 async def _fetch_portfolio(owner_id: str, pool: asyncpg.Pool) -> list[dict]:
     rows = await pool.fetch(
         """
-        SELECT symbol, quantity, cost_basis, currency, account
+        SELECT symbol, quantity, cost_basis, currency, account,
+               MIN(date) OVER (PARTITION BY symbol) AS entry_date
         FROM portfolio_positions
         WHERE user_id = $1
         ORDER BY date DESC
@@ -84,14 +99,80 @@ async def _fetch_portfolio(owner_id: str, pool: asyncpg.Pool) -> list[dict]:
         """,
         owner_id,
     )
-    return [dict(r) for r in rows]
+    # Convert rows to dicts; handle asyncpg Record, plain dict, and mock objects.
+    # NOTE: dict(MagicMock) returns {} without raising — must validate the result.
+    result = []
+    for r in rows:
+        if isinstance(r, dict):
+            result.append(r)
+            continue
+        # Try dict() first (works for asyncpg.Record)
+        d = None
+        try:
+            d = dict(r)
+        except Exception:
+            pass
+        # Validate dict() produced real data — empty dict means MagicMock/bad row
+        if d and isinstance(d.get("symbol"), str):
+            result.append(d)
+        else:
+            # Attribute access fallback for MagicMock and object-style rows
+            result.append({
+                "symbol": _safe_get(r, "symbol"),
+                "quantity": _safe_get(r, "quantity"),
+                "cost_basis": _safe_get(r, "cost_basis"),
+                "currency": _safe_get(r, "currency"),
+                "account": _safe_get(r, "account"),
+                "entry_date": _safe_get(r, "entry_date"),
+            })
+    return result
+
+
+async def _fetch_prices(
+    symbols: list[str], pool: asyncpg.Pool
+) -> tuple[dict[str, float], Optional[date]]:
+    """
+    Fetch latest price for each symbol from prices table.
+    Returns (prices_dict, prices_as_of_date).
+    If no symbols or no prices found, returns ({}, None).
+    """
+    if not symbols:
+        return {}, None
+
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT ON (symbol) symbol, close, date
+        FROM prices
+        WHERE symbol = ANY($1)
+        ORDER BY symbol, date DESC
+        """,
+        symbols,
+    )
+
+    prices = {}
+    latest_date = None
+    for row in rows:
+        symbol = _safe_get(row, "symbol")
+        close = _safe_get(row, "close")
+        row_date = _safe_get(row, "date")
+        if symbol and close is not None:
+            prices[symbol] = float(close)
+            if latest_date is None or row_date > latest_date:
+                latest_date = row_date
+
+    return prices, latest_date
 
 
 # ─────────────────────────────────────────────────────────────
 # Analysis
 # ─────────────────────────────────────────────────────────────
 
-def _analyse(rows: list[dict], tickers_mentioned: list[str]) -> PortfolioFitAnalysis:
+def _analyse(
+    rows: list[dict],
+    tickers_mentioned: list[str],
+    prices: dict[str, float] | None = None,
+    prices_as_of: Optional[date] = None,
+) -> PortfolioFitAnalysis:
     if not rows:
         return PortfolioFitAnalysis(
             tickers_mentioned=tickers_mentioned,
@@ -101,11 +182,12 @@ def _analyse(rows: list[dict], tickers_mentioned: list[str]) -> PortfolioFitAnal
 
     # ── Normalize portfolio (compute invested capital per ticker) ─────────────
     # normalize_portfolio deduplicates by ticker (takes newest row per ticker)
-    norm = normalize_portfolio(rows)
+    # If prices provided, also computes position values, P&L, and portfolio weights
+    norm = normalize_portfolio(rows, prices=prices, prices_as_of=prices_as_of)
 
     # ── Unique tickers in portfolio ───────────────────────────────────────────
     port_tickers = list(norm.allocation_pct.keys()) if norm.allocation_pct else list(
-        {r["symbol"].upper() for r in rows}
+        {_safe_get(r, "symbol", "").upper() for r in rows if _safe_get(r, "symbol")}
     )
     mentioned_upper = [t.upper() for t in tickers_mentioned]
     already_held = [t for t in mentioned_upper if t in set(port_tickers)]

@@ -246,6 +246,39 @@ def _render_normalized_portfolio(np: NormalizedPortfolio) -> str:
     else:
         lines.append("  Allocation: unavailable")
 
+    # Per-position enrichment when prices are available
+    if np.positions:
+        lines.append("  Position details (when prices available):")
+        for ticker, detail in list(np.positions.items())[:10]:  # cap at 10 for brevity
+            detail_parts = []
+            if detail.entry_date:
+                detail_parts.append(f"entry={detail.entry_date}")
+            if detail.current_price is not None:
+                detail_parts.append(f"price={detail.current_price:.2f}")
+            if detail.position_value is not None:
+                detail_parts.append(f"value={detail.position_value:,.2f}")
+            if detail.position_pnl is not None:
+                sign = "+" if detail.position_pnl >= 0 else ""
+                detail_parts.append(f"pnl={sign}{detail.position_pnl:,.2f}")
+            if detail.position_pnl_pct is not None:
+                sign = "+" if detail.position_pnl_pct >= 0 else ""
+                detail_parts.append(f"pnl_pct={sign}{detail.position_pnl_pct:.1f}%")
+            if detail.portfolio_weight is not None:
+                detail_parts.append(f"weight={detail.portfolio_weight:.1f}%")
+
+            if detail_parts:
+                lines.append(f"    {ticker}: {', '.join(detail_parts)}")
+            else:
+                lines.append(f"    {ticker}: (no price data available)")
+        if len(np.positions) > 10:
+            lines.append(f"    ... and {len(np.positions) - 10} more positions")
+
+    # Market value summary and price freshness
+    if np.total_market_value is not None:
+        lines.append(f"  Total market value: {np.currency} {np.total_market_value:,.2f}")
+    if np.prices_as_of:
+        lines.append(f"  Prices as of: {np.prices_as_of}")
+
     lines.append(f"  Note: {np.data_note}")
     return "\n".join(lines)
 

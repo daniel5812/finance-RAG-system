@@ -23,3 +23,4 @@ python-jose[cryptography]
 google-auth
 passlib[bcrypt]
 yfinance
+pytest-asyncio   # required for @pytest.mark.asyncio in test_portfolio_enrichment.py
