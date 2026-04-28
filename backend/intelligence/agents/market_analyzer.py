@@ -74,10 +74,26 @@ class MarketAnalyzerAgent:
         """
         try:
             macro, macro_dates = await _fetch_macro_latest(pool)
-            fx    = await _fetch_fx_latest(pool, "USD", "ILS")
+            fx          = await _fetch_fx_latest(pool, "USD", "ILS")
             yield_curve = await _fetch_yield_curve(pool)
-            vix   = await _fetch_vix(pool)
-            ctx   = _classify_regime(macro, macro_dates, fx, yield_curve, vix)
+            vix         = await _fetch_vix(pool)
+            ctx         = _classify_regime(macro, macro_dates, fx, yield_curve, vix)
+
+            # Trend signals — each isolated so one failure doesn't skip the others
+            for _signal_name, _fn in (
+                ("inflation_trend", _compute_inflation_trend),
+                ("fed_trend", _compute_fed_trend),
+            ):
+                try:
+                    label = await _fn(pool)
+                    if label:
+                        ctx.macro_signals.append(label)
+                except Exception as _exc:
+                    logger.warning(
+                        f'{{"event": "market_analyzer_agent", "signal": "{_signal_name}", '
+                        f'"status": "skipped", "error": "{_exc}"}}'
+                    )
+
             logger.info(
                 f'{{"event": "market_analyzer_agent", "status": "ok", '
                 f'"regime": "{ctx.regime}", "confidence": "{ctx.regime_confidence}", '
@@ -132,26 +148,16 @@ async def _fetch_fx_latest(pool: asyncpg.Pool, base: str, quote: str) -> float |
 
 
 async def _fetch_yield_curve(pool: asyncpg.Pool) -> float | None:
-    """
-    Return 10Y-2Y Treasury spread from macro_series.
-    Requires DGS10 and DGS2 series. Returns None if either is missing.
-    """
-    rows = await pool.fetch(
+    """Return 10Y-2Y Treasury spread directly from T10Y2Y series in macro_series."""
+    row = await pool.fetchrow(
         """
-        SELECT DISTINCT ON (series_id)
-            series_id, value
-        FROM macro_series
-        WHERE series_id = ANY($1::text[])
-        ORDER BY series_id, date DESC
-        """,
-        ["DGS10", "DGS2"],
+        SELECT value FROM macro_series
+        WHERE series_id = 'T10Y2Y'
+        ORDER BY date DESC
+        LIMIT 1
+        """
     )
-    vals = {r["series_id"]: float(r["value"]) for r in rows}
-    dgs10 = vals.get("DGS10")
-    dgs2  = vals.get("DGS2")
-    if dgs10 is not None and dgs2 is not None:
-        return round(dgs10 - dgs2, 3)
-    return None
+    return float(row["value"]) if row else None
 
 
 async def _fetch_vix(pool: asyncpg.Pool) -> float | None:
@@ -165,6 +171,52 @@ async def _fetch_vix(pool: asyncpg.Pool) -> float | None:
         """
     )
     return float(row["value"]) if row else None
+
+
+async def _compute_inflation_trend(pool: asyncpg.Pool) -> str | None:
+    """
+    Compare the latest 3 CPIAUCNS readings (ordered newest first) to label
+    the 3-month inflation direction. Returns None if fewer than 2 rows exist.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT value FROM macro_series
+        WHERE series_id = 'CPIAUCNS'
+        ORDER BY date DESC
+        LIMIT 3
+        """
+    )
+    if len(rows) < 2:
+        return None
+    delta = float(rows[0]["value"]) - float(rows[-1]["value"])
+    if delta > 0.5:
+        return "Inflation trend: RISING (3-month)"
+    if delta < -0.5:
+        return "Inflation trend: FALLING (3-month)"
+    return "Inflation trend: STABLE (3-month)"
+
+
+async def _compute_fed_trend(pool: asyncpg.Pool) -> str | None:
+    """
+    Compare the latest 3 FEDFUNDS readings (ordered newest first) to label
+    the direction of Fed rate policy. Returns None if fewer than 2 rows exist.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT value FROM macro_series
+        WHERE series_id = 'FEDFUNDS'
+        ORDER BY date DESC
+        LIMIT 3
+        """
+    )
+    if len(rows) < 2:
+        return None
+    delta = float(rows[0]["value"]) - float(rows[-1]["value"])
+    if delta > 0.10:
+        return "Fed rate: HIKING"
+    if delta < -0.10:
+        return "Fed rate: CUTTING"
+    return "Fed rate: HOLDING"
 
 
 # ─────────────────────────────────────────────────────────────
