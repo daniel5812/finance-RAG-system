@@ -49,7 +49,9 @@ import re
 import asyncpg
 
 from core.logger import get_logger
+from financial.crud import fetch_benchmark_holdings
 from intelligence.agents.asset_profiler import AssetProfilerAgent
+from intelligence.agents.benchmark_comparison import BenchmarkComparisonAgent
 from intelligence.agents.market_analyzer import MarketAnalyzerAgent
 from intelligence.agents.portfolio_fit import PortfolioFitAgent
 from intelligence.agents.portfolio_gap_analysis import PortfolioGapAnalysisAgent
@@ -144,6 +146,12 @@ class IntelligenceOrchestrator:
                 parallel_tasks["portfolio"] = asyncio.create_task(
                     PortfolioFitAgent.run(tickers, owner_id, pool)
                 )
+                parallel_tasks["spy_holdings"] = asyncio.create_task(
+                    fetch_benchmark_holdings(pool, "SPY")
+                )
+                parallel_tasks["qqq_holdings"] = asyncio.create_task(
+                    fetch_benchmark_holdings(pool, "QQQ")
+                )
 
             # Await all parallel tasks
             parallel_results = {}
@@ -193,6 +201,31 @@ class IntelligenceOrchestrator:
                         f'"status": "failed", "error": "{exc}"}}'
                     )
                     report.agents_skipped.append(f"PortfolioGapAnalysisAgent: {exc}")
+
+            # ── Benchmark Comparison (runs whenever portfolio data is present) ─
+            # Not gated on `not tickers` — useful even when specific tickers mentioned.
+            if run_full and report.normalized_portfolio:
+                try:
+                    spy_h = parallel_results.get("spy_holdings", [])
+                    qqq_h = parallel_results.get("qqq_holdings", [])
+                    portfolio_hhi = (
+                        report.portfolio_gap_analysis.concentration_score
+                        if report.portfolio_gap_analysis else None
+                    )
+                    benchmark_comparison = BenchmarkComparisonAgent.run(
+                        normalized_portfolio=report.normalized_portfolio,
+                        portfolio_hhi=portfolio_hhi,
+                        spy_holdings=spy_h,
+                        qqq_holdings=qqq_h,
+                    )
+                    report.benchmark_comparison = benchmark_comparison
+                    report.agents_ran.append("BenchmarkComparisonAgent")
+                except Exception as exc:
+                    logger.warning(
+                        f'{{"event": "orchestrator", "agent": "BenchmarkComparisonAgent", '
+                        f'"status": "failed", "error": "{exc}"}}'
+                    )
+                    report.agents_skipped.append(f"BenchmarkComparisonAgent: {exc}")
 
             # ── Stage 2: Scoring (depends on stage 1) ───────────────────
             if run_full and asset_profiles:

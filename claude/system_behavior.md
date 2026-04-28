@@ -270,6 +270,34 @@ Semantic Rewrite
 - Cap 10 tokens
 - Add context suffix
 
+## Benchmark Comparison (Step 3)
+
+**Purpose**: Analyze portfolio concentration vs SPY/QQQ benchmarks.
+
+**Coverage Gate (CRITICAL)**
+- HHI is computed ONLY when benchmark holdings weight sum ≥80%
+- If coverage < 80%:
+  - `hhi = None`
+  - `data_note` explains: "HHI suppressed — benchmark coverage {X}% below 80% threshold"
+- No fallback estimation; no LLM override
+
+**Derived Metrics**
+- Concentration label: compares portfolio HHI vs benchmark HHI
+  - portfolio_hhi > benchmark_hhi → "more_concentrated"
+  - portfolio_hhi < benchmark_hhi → "less_concentrated"
+  - Approximately equal → "comparable"
+- Overweight/underweight (delta ≥2.0pp): portfolio_weight - benchmark_weight
+- Portfolio overlap: sum(weights of portfolio tickers found in benchmark holdings)
+- Weight basis: "market_value" | "cost_basis" | "mixed"
+- Top sectors: SPY from static _SPY_SECTOR_WEIGHTS; QQQ computed from holdings
+
+**Test Data Requirements**
+- All test benchmark holdings must have weight sums ≥80.0%
+- Explicit assertions: `assert sum(h["weight"] for h in holdings) >= 80.0`
+- Prevents regression of coverage-based HHI suppression
+
+---
+
 ## Intelligence Layer
 
 Pipeline Stages

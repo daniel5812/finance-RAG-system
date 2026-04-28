@@ -227,6 +227,47 @@ class PortfolioFitAnalysis(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────
+# Step 3: Benchmark Comparison output
+# ─────────────────────────────────────────────────────────────
+
+class BenchmarkSnapshot(BaseModel):
+    """
+    Metrics for a single benchmark (SPY or QQQ) at comparison time.
+    hhi is suppressed (None) when holdings coverage < 80% to avoid
+    misleading comparisons from partial data.
+    """
+    symbol: str
+    hhi: Optional[float] = None              # None when coverage_pct < 80%
+    holding_count: Optional[int] = None      # rows fetched from etf_holdings
+    coverage_pct: Optional[float] = None     # SUM(weight) of fetched holdings
+    top_sectors: dict[str, float] = Field(default_factory=dict)  # sector → %
+    data_note: Optional[str] = None          # set when HHI suppressed or sectors partial
+
+
+class BenchmarkComparison(BaseModel):
+    """
+    Deterministic comparison of the user portfolio against SPY and QQQ.
+    All arithmetic is computed in BenchmarkComparisonAgent — the LLM MUST NOT
+    recompute or contradict these values.
+
+    weight_basis indicates which portfolio weight source was used:
+      "market_value" — PositionDetail.portfolio_weight (requires prices)
+      "cost_basis"   — NormalizedPortfolio.allocation_pct (always available)
+      "mixed"        — market_value for priced positions, cost_basis for unpriced
+    """
+    portfolio_hhi: Optional[float] = None
+    weight_basis: str = "cost_basis"
+    benchmarks: list[BenchmarkSnapshot] = Field(default_factory=list)
+    concentration_vs_spy: Optional[str] = None   # "more_concentrated"|"comparable"|"less_concentrated"
+    concentration_vs_qqq: Optional[str] = None
+    overweight_vs_spy: list[str] = Field(default_factory=list)   # ["NVDA: port=12.1% spy=4.1% (+8.0pp)"]
+    underweight_vs_spy: list[str] = Field(default_factory=list)
+    portfolio_overlap_spy_pct: Optional[float] = None
+    portfolio_overlap_qqq_pct: Optional[float] = None
+    data_note: Optional[str] = None
+
+
+# ─────────────────────────────────────────────────────────────
 # Agent: Recommendation output
 # ─────────────────────────────────────────────────────────────
 
@@ -256,6 +297,7 @@ class IntelligenceReport(BaseModel):
     portfolio_fit: Optional[PortfolioFitAnalysis] = None
     normalized_portfolio: Optional[NormalizedPortfolio] = None   # pre-computed financial metrics
     portfolio_gap_analysis: Optional[PortfolioGapAnalysis] = None  # sector/class gap vs benchmark
+    benchmark_comparison: Optional[BenchmarkComparison] = None   # Step 3: SPY/QQQ comparison
     recommendations: list[AssetRecommendation] = Field(default_factory=list)
     asset_scores: list[AssetScore] = Field(default_factory=list)
     validation_result: Optional[ValidationResult] = None         # post-generation sanity check

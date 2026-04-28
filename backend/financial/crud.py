@@ -127,6 +127,38 @@ async def upsert_etf_holdings(pool: asyncpg.Pool, rows: list[dict]) -> int:
     return len(rows)
 
 
+async def fetch_benchmark_holdings(pool: asyncpg.Pool, etf_symbol: str) -> list[dict]:
+    """
+    Fetch the most recent holdings snapshot for a benchmark ETF (SPY, QQQ).
+
+    Returns list of {holding_symbol, weight} dicts ordered by weight descending.
+    Weight is stored as a percentage (0–100).
+    Returns empty list when no rows exist — never raises.
+
+    NOTE: etf_holdings.sector is not read here — it is NULL for all rows from
+    the current Yahoo client. Sector mapping is done via _SECTOR_MAP in the agent.
+    """
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT holding_symbol, weight
+            FROM etf_holdings
+            WHERE etf_symbol = $1
+              AND date = (
+                  SELECT MAX(date) FROM etf_holdings WHERE etf_symbol = $1
+              )
+            ORDER BY weight DESC
+            """,
+            etf_symbol.upper(),
+        )
+        return [
+            {"holding_symbol": r["holding_symbol"], "weight": float(r["weight"])}
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
 async def update_etf_tracker(pool: asyncpg.Pool, etf_symbol: str, new_hash: str):
     await pool.execute(
         """
