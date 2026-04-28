@@ -71,26 +71,32 @@ def test_benchmark_comparison_full_spy_coverage():
     norm = _normalized_portfolio(portfolio_alloc, positions_detail=positions)
     portfolio_hhi = 0.52  # (0.6)^2 + (0.4)^2 = 0.36 + 0.16
 
-    # SPY holdings: 15 tickers, total coverage ≥ 80% (sum = 80.0)
+    # SPY holdings: 20 tickers, total coverage ≥ 80% (sum = 80.3)
     spy_holdings = [
-        _holding("AAPL", 7.2),
-        _holding("MSFT", 6.8),
-        _holding("GOOGL", 5.5),
-        _holding("AMZN", 4.2),
-        _holding("NVDA", 4.1),
-        _holding("META", 3.5),
-        _holding("TSLA", 3.2),
-        _holding("JPM", 3.1),
-        _holding("V", 2.9),
-        _holding("JNJ", 2.8),
-        _holding("WMT", 2.7),
-        _holding("PG", 2.6),
-        _holding("XOM", 2.5),
-        _holding("BAC", 2.4),
-        _holding("CVX", 2.3),
-    ]  # Total: 80.0%
+        _holding("AAPL", 7.5),
+        _holding("MSFT", 7.1),
+        _holding("GOOGL", 5.8),
+        _holding("AMZN", 4.5),
+        _holding("NVDA", 4.4),
+        _holding("META", 3.8),
+        _holding("TSLA", 3.5),
+        _holding("JPM", 3.4),
+        _holding("V", 3.2),
+        _holding("JNJ", 3.1),
+        _holding("WMT", 3.0),
+        _holding("PG", 2.9),
+        _holding("XOM", 2.8),
+        _holding("BAC", 2.7),
+        _holding("CVX", 2.6),
+        _holding("UNH", 2.5),
+        _holding("MCD", 2.4),
+        _holding("NFLX", 2.3),
+        _holding("ADBE", 2.2),
+        _holding("CRM", 2.1),
+    ]  # Total: 80.3%
+    assert sum(h["weight"] for h in spy_holdings) >= 80.0
 
-    # QQQ holdings: tech, coverage ≥ 80% (sum = 82.0)
+    # QQQ holdings: tech, coverage ≥ 80% (sum = 80.0)
     qqq_holdings = [
         _holding("AAPL", 8.1),
         _holding("MSFT", 7.8),
@@ -106,7 +112,10 @@ def test_benchmark_comparison_full_spy_coverage():
         _holding("ORCL", 2.7),
         _holding("CSCO", 2.4),
         _holding("QCOM", 2.2),
-    ]  # Total: 82.0%
+        _holding("INTU", 2.0),
+        _holding("AVGO", 1.8),
+    ]  # Total: 80.0%
+    assert sum(h["weight"] for h in qqq_holdings) >= 80.0
 
     bc = BenchmarkComparisonAgent.run(norm, portfolio_hhi, spy_holdings, qqq_holdings)
 
@@ -115,7 +124,7 @@ def test_benchmark_comparison_full_spy_coverage():
     assert spy is not None
     assert spy.hhi is not None  # HHI computed (coverage ≥ 80%)
     assert spy.coverage_pct >= 80.0
-    assert spy.holding_count == 15
+    assert spy.holding_count == 20
     assert spy.top_sectors == _SPY_SECTOR_WEIGHTS  # static dict
 
     # Check QQQ snapshot
@@ -123,7 +132,7 @@ def test_benchmark_comparison_full_spy_coverage():
     assert qqq is not None
     assert qqq.hhi is not None  # HHI computed (coverage ≥ 80%)
     assert qqq.coverage_pct >= 80.0
-    assert qqq.holding_count == 14
+    assert qqq.holding_count == 16
 
     # Concentration labels set (both HHIs present)
     assert bc.concentration_vs_spy is not None
@@ -571,28 +580,32 @@ def test_real_world_concentrated_tech_portfolio():
     #              = 0.1225 + 0.09 + 0.0225 + 0.01 + 0.0025 + 0.0025 = 0.25
     portfolio_hhi = 0.25
 
-    # SPY: broad market, ≥80% coverage for HHI computation
+    # SPY: broad market, ≥80% coverage for HHI computation (sum = 80.2)
     spy_holdings = [
-        _holding("AAPL", 7.2),
-        _holding("MSFT", 6.8),
-        _holding("GOOGL", 5.5),
-        _holding("AMZN", 4.2),
-        _holding("NVDA", 4.1),
-        _holding("META", 3.5),
-        _holding("TSLA", 3.2),
-        _holding("JPM", 3.1),
-        _holding("JNJ", 2.8),
-        _holding("V", 2.9),
-        _holding("WMT", 2.7),
-        _holding("PG", 2.6),
-        _holding("XOM", 2.5),
-        _holding("BAC", 2.4),
-        _holding("CVX", 2.3),
-        _holding("MCD", 2.2),
-        _holding("NKE", 2.1),
-    ]  # Total: 80.1%
+        _holding("AAPL", 7.5),
+        _holding("MSFT", 7.1),
+        _holding("GOOGL", 5.8),
+        _holding("AMZN", 4.5),
+        _holding("NVDA", 4.4),
+        _holding("META", 3.8),
+        _holding("TSLA", 3.5),
+        _holding("JPM", 3.4),
+        _holding("JNJ", 3.1),
+        _holding("V", 3.2),
+        _holding("WMT", 3.0),
+        _holding("PG", 2.9),
+        _holding("XOM", 2.8),
+        _holding("BAC", 2.7),
+        _holding("CVX", 2.6),
+        _holding("MCD", 2.4),
+        _holding("NKE", 2.3),
+        _holding("UNH", 2.2),
+        _holding("HD", 2.1),
+        _holding("DIS", 2.0),
+    ]  # Total: 80.2%
+    assert sum(h["weight"] for h in spy_holdings) >= 80.0
 
-    # QQQ: tech-heavy, ≥80% coverage for HHI computation
+    # QQQ: tech-heavy, ≥80% coverage for HHI computation (sum = 80.0)
     qqq_holdings = [
         _holding("AAPL", 8.1),
         _holding("MSFT", 7.8),
@@ -608,7 +621,10 @@ def test_real_world_concentrated_tech_portfolio():
         _holding("ORCL", 2.7),
         _holding("CSCO", 2.4),
         _holding("QCOM", 2.2),
-    ]  # Total: 82.0%
+        _holding("INTU", 2.0),
+        _holding("AVGO", 1.8),
+    ]  # Total: 80.0%
+    assert sum(h["weight"] for h in qqq_holdings) >= 80.0
 
     bc = BenchmarkComparisonAgent.run(norm, portfolio_hhi, spy_holdings, qqq_holdings)
 
