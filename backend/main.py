@@ -78,19 +78,23 @@ async def _seed_prices_if_empty(pool) -> None:
 
 async def _seed_macro_if_empty(pool) -> None:
     """
-    Non-blocking startup hook: seed core FRED macro series if macro_series table is empty.
+    Non-blocking startup hook: seed core FRED macro series if any are missing.
+    Seeds per-series so adding new series (VIXCLS, T10Y2Y) does not require
+    an empty table — each missing series is seeded independently.
     Requires a valid FRED_API_KEY in the environment.
     """
     try:
-        count = await pool.fetchval("SELECT COUNT(*) FROM macro_series")
-        if count == 0:
-            logger.info("macro_series empty — seeding FRED series on startup...")
-            from financial.providers.macro import FREDProvider
-            for series_id in ["CPIAUCNS", "FEDFUNDS", "GDP", "UNRATE"]:
+        from financial.providers.macro import FREDProvider
+        for series_id in ["CPIAUCNS", "FEDFUNDS", "GDP", "UNRATE", "VIXCLS", "T10Y2Y"]:
+            count = await pool.fetchval(
+                "SELECT COUNT(*) FROM macro_series WHERE series_id = $1", series_id
+            )
+            if count == 0:
+                logger.info(f"macro_series empty for {series_id} — seeding from FRED...")
                 result = await FREDProvider(series_id=series_id).ingest(pool)
                 logger.info(f"Macro seed {series_id}: {result.get('status')}, rows={result.get('rows_ingested', 0)}")
-        else:
-            logger.info(f"macro_series already populated ({count} rows) — seed skipped")
+            else:
+                logger.info(f"macro_series already populated for {series_id} ({count} rows) — skipped")
     except Exception as e:
         logger.warning(f"Macro seed failed (non-fatal): {e}")
 
