@@ -10,11 +10,18 @@ Pipeline:
     3. ✅ Text chunking         (CPU-bound → asyncio.to_thread)
     4. ✅ Embedding             (CPU-bound → asyncio.to_thread)
     5. ✅ Pinecone upsert       (I/O-bound → asyncio.get_running_loop().run_in_executor)
+    2b. ✅ Document classification (deterministic keyword signals, no LLM)
+    2c. ✅ Holdings extraction    (broker/portfolio only, non-fatal, no LLM)
 
 Design rules:
     - Fail safely: any unhandled exception → status = "failed", never crash the API
     - CPU vs I/O: extraction/chunking/embedding run in a thread (not the event loop)
     - Never log chunk text or PII — only IDs, counts, and latency
+
+# TODO (storage — deferred):
+#   storage_backend: local | s3
+#   Use object_key instead of storage_path when backend = s3
+#   Return signed URLs for retrieval — no public access
 """
 
 import asyncio
@@ -26,7 +33,10 @@ from typing import Any
 
 _embed_lock = threading.Lock()
 
-from documents.crud import update_document_status
+from documents.crud import update_document_status, update_document_classification, insert_document_holdings, insert_financial_statement
+from documents.classifier import classify_document
+from documents.extractor import extract_holdings
+from documents.financial_statement_extractor import extract_financial_statement
 from core.logger import get_logger
 from rag.processing import chunk_text
 
@@ -137,6 +147,7 @@ async def _upsert_vectors(
     pinecone_index: Any,
     document_id: str,
     owner_id: str,
+    doc_type: str,
     chunks: list[str],
     vectors: list[list[float]],
 ) -> int:
@@ -182,6 +193,7 @@ async def _upsert_vectors(
             "metadata": {
                 "owner_id": owner_id,
                 "document_id": document_id,
+                "doc_type": doc_type,
                 "text": chunks[i],           # stored for retrieval — never logged
                 "chunk_index": i,
                 "total_chunks": len(chunks),
@@ -227,22 +239,96 @@ async def process_document_worker(
 
     await _set_status(pool, document_id, "processing")
 
+    # ── Step 2: Extract text (CPU → thread) ──────────────────────────────
+    raw_text: str = await asyncio.to_thread(_extract_text, file_path)
+
+    if not raw_text.strip():
+        await _set_status(pool, document_id, "failed")
+        logger.error(json.dumps({
+            "event": "worker_failed",
+            "document_id": document_id,
+            "error": "No extractable text found. The PDF may be a scanned image. OCR support is not yet implemented.",
+            "elapsed_s": round(time.time() - t_start, 2),
+        }))
+        return
+
+    logger.info(json.dumps({
+        "event": "text_extracted",
+        "document_id": document_id,
+        "char_count": len(raw_text),
+    }))
+
     try:
 
-        # ── Step 2: Extract text (CPU → thread) ──────────────────────────────
-        raw_text: str = await asyncio.to_thread(_extract_text, file_path)
+        # ── Step 2b: Classify document type (deterministic, no LLM) ──────────
+        filename = file_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        try:
+            doc_type, confidence = classify_document(filename, raw_text)
+            await update_document_classification(pool, document_id, doc_type, confidence)
+            logger.info(json.dumps({
+                "event": "document_classified",
+                "document_id": document_id,
+                "doc_type": doc_type,
+                "confidence": confidence,
+            }))
+        except Exception as exc:
+            # Classification failure is non-fatal — fall back to unknown
+            doc_type = "unknown"
+            logger.warning(json.dumps({
+                "event": "classification_failed",
+                "document_id": document_id,
+                "error": str(exc),
+            }))
 
-        if not raw_text.strip():
-            raise ValueError(
-                "No extractable text found. The PDF may be a scanned image. "
-                "OCR support is not yet implemented."
-            )
+        # ── Step 2c: Extract holdings (gated on doc_type, non-fatal) ────────────
+        if doc_type in ("broker_statement", "portfolio_statement"):
+            try:
+                holdings = await asyncio.to_thread(extract_holdings, raw_text, doc_type)
+                if holdings:
+                    await insert_document_holdings(pool, document_id, owner_id, holdings)
+                    logger.info(json.dumps({
+                        "event": "holdings_extracted",
+                        "document_id": document_id,
+                        "doc_type": doc_type,
+                        "count": len(holdings),
+                    }))
+                else:
+                    logger.debug(json.dumps({
+                        "event": "extraction_empty",
+                        "document_id": document_id,
+                        "doc_type": doc_type,
+                    }))
+            except Exception as exc:
+                # Extraction failure is non-fatal — never blocks indexing
+                logger.warning(json.dumps({
+                    "event": "extraction_failed",
+                    "document_id": document_id,
+                    "error": str(exc),
+                }))
 
-        logger.info(json.dumps({
-            "event": "text_extracted",
-            "document_id": document_id,
-            "char_count": len(raw_text),
-        }))
+        # ── Step 2d: Extract financial statement fields (savings_statement only) ──
+        if doc_type == "savings_statement":
+            try:
+                stmt_data = await asyncio.to_thread(
+                    extract_financial_statement, raw_text, doc_type
+                )
+                if stmt_data is not None:
+                    await insert_financial_statement(pool, document_id, owner_id, stmt_data)
+                    logger.info(json.dumps({
+                        "event": "financial_statement_extracted",
+                        "document_id": document_id,
+                    }))
+                else:
+                    logger.debug(json.dumps({
+                        "event": "financial_statement_extraction_empty",
+                        "document_id": document_id,
+                    }))
+            except Exception as exc:
+                logger.warning(json.dumps({
+                    "event": "financial_statement_extraction_failed",
+                    "document_id": document_id,
+                    "error": str(exc),
+                }))
 
         # ── Save extracted text to disk for Source Viewer ──
         try:
@@ -250,7 +336,11 @@ async def process_document_worker(
             with open(text_path, "w", encoding="utf-8") as f:
                 f.write(raw_text)
         except Exception as e:
-            logger.warning(f"Failed to save extracted text for {document_id}: {e}")
+            logger.warning(json.dumps({
+                "event": "text_save_failed",
+                "document_id": document_id,
+                "error": str(e),
+            }))
 
         # ── Step 3: Chunk (CPU → thread) ─────────────────────────────────────
         chunks: list[str] = await asyncio.to_thread(chunk_text, raw_text)
@@ -275,12 +365,12 @@ async def process_document_worker(
 
         # ── Step 5: Upsert to Pinecone (I/O → executor) ──────────────────────
         t_upsert = time.time()
-        upserted = await _upsert_vectors(pinecone_index, document_id, owner_id, chunks, vectors)
+        upserted = await _upsert_vectors(pinecone_index, document_id, owner_id, doc_type, chunks, vectors)
 
         logger.info(json.dumps({
             "event": "vectors_upserted",
             "document_id": document_id,
-            "upserted_count": upserted,
+            "upserted_count": len(chunks),
             "upsert_latency_s": round(time.time() - t_upsert, 2),
         }))
 

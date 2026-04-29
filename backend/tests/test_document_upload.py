@@ -529,3 +529,185 @@ async def test_worker_no_holdings_found_does_not_insert():
         )
 
     mock_insert.assert_not_awaited()
+
+
+# ── Step 5C: Financial statement extraction worker flow ───────────────────────
+
+@pytest.mark.asyncio
+async def test_worker_runs_financial_extraction_for_savings_statement():
+    """
+    Worker must call extract_financial_statement when doc_type=savings_statement.
+    """
+    from documents import worker
+    from documents.financial_statement_extractor import FinancialStatementData
+
+    fake_data = FinancialStatementData(
+        provider="מגדל", account_type="gemel", account_number="12345",
+        report_date="2024-12-31", period_start="2024-01-01", period_end="2024-12-31",
+        ending_balance=100000.0, annual_deposits=12000.0, investment_gains=5000.0,
+        management_fees=800.0, track_name="מסלול מנייתי",
+        equity_exposure_pct=65.0, fx_exposure_pct=10.0,
+    )
+
+    pool = MagicMock()
+    pool.execute = AsyncMock()
+
+    with (
+        patch.object(worker, "_extract_text", return_value="קופת גמל מגדל דוח שנתי"),
+        patch("documents.worker.classify_document", return_value=("savings_statement", "high")),
+        patch("documents.worker.update_document_classification", new_callable=AsyncMock),
+        patch("documents.worker.update_document_status", new_callable=AsyncMock),
+        patch("documents.worker.extract_financial_statement", return_value=fake_data) as mock_extract,
+        patch("documents.worker.insert_financial_statement", new_callable=AsyncMock) as mock_insert,
+        patch("documents.worker.chunk_text", return_value=["chunk"]),
+        patch.object(worker, "_embed_chunks", return_value=[[0.1] * 384]),
+        patch.object(worker, "_upsert_vectors", new_callable=AsyncMock),
+    ):
+        await worker.process_document_worker(
+            pool=pool,
+            pinecone_index=MagicMock(),
+            embed_model=MagicMock(encode=MagicMock(return_value=[[0.1] * 384])),
+            document_id="doc-savings",
+            file_path="/uploads/doc-savings.pdf",
+            owner_id="user-1",
+        )
+
+    mock_extract.assert_called_once()
+    mock_insert.assert_awaited_once_with(pool, "doc-savings", "user-1", fake_data)
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_financial_extraction_for_broker_statement():
+    """
+    extract_financial_statement must NOT be called for non-savings doc types.
+    """
+    from documents import worker
+
+    pool = MagicMock()
+    pool.execute = AsyncMock()
+
+    with (
+        patch.object(worker, "_extract_text", return_value="brokerage account statement trade confirmation"),
+        patch("documents.worker.classify_document", return_value=("broker_statement", "high")),
+        patch("documents.worker.update_document_classification", new_callable=AsyncMock),
+        patch("documents.worker.update_document_status", new_callable=AsyncMock),
+        patch("documents.worker.extract_holdings", return_value=[]),
+        patch("documents.worker.insert_document_holdings", new_callable=AsyncMock),
+        patch("documents.worker.extract_financial_statement") as mock_fin_extract,
+        patch("documents.worker.chunk_text", return_value=["chunk"]),
+        patch.object(worker, "_embed_chunks", return_value=[[0.1] * 384]),
+        patch.object(worker, "_upsert_vectors", new_callable=AsyncMock),
+    ):
+        await worker.process_document_worker(
+            pool=pool,
+            pinecone_index=MagicMock(),
+            embed_model=MagicMock(encode=MagicMock(return_value=[[0.1] * 384])),
+            document_id="doc-broker-nofin",
+            file_path="/uploads/doc-broker-nofin.pdf",
+            owner_id="user-1",
+        )
+
+    mock_fin_extract.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_financial_extraction_for_unknown_type():
+    """
+    extract_financial_statement must NOT be called when doc_type=unknown.
+    """
+    from documents import worker
+
+    pool = MagicMock()
+    pool.execute = AsyncMock()
+
+    with (
+        patch.object(worker, "_extract_text", return_value="some document content here"),
+        patch("documents.worker.classify_document", return_value=("unknown", "low")),
+        patch("documents.worker.update_document_classification", new_callable=AsyncMock),
+        patch("documents.worker.update_document_status", new_callable=AsyncMock),
+        patch("documents.worker.extract_financial_statement") as mock_fin_extract,
+        patch("documents.worker.chunk_text", return_value=["chunk"]),
+        patch.object(worker, "_embed_chunks", return_value=[[0.1] * 384]),
+        patch.object(worker, "_upsert_vectors", new_callable=AsyncMock),
+    ):
+        await worker.process_document_worker(
+            pool=pool,
+            pinecone_index=MagicMock(),
+            embed_model=MagicMock(encode=MagicMock(return_value=[[0.1] * 384])),
+            document_id="doc-unk-nofin",
+            file_path="/uploads/doc-unk-nofin.pdf",
+            owner_id="user-1",
+        )
+
+    mock_fin_extract.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_financial_extraction_failure_does_not_block_indexing():
+    """
+    If extract_financial_statement raises, the worker continues and completes indexing.
+    status must be completed, not failed.
+    """
+    from documents import worker
+
+    pool = MagicMock()
+    pool.execute = AsyncMock()
+
+    with (
+        patch.object(worker, "_extract_text", return_value="קופת גמל מגדל דוח שנתי"),
+        patch("documents.worker.classify_document", return_value=("savings_statement", "high")),
+        patch("documents.worker.update_document_classification", new_callable=AsyncMock),
+        patch("documents.worker.update_document_status", new_callable=AsyncMock) as mock_status,
+        patch("documents.worker.extract_financial_statement", side_effect=RuntimeError("extractor exploded")),
+        patch("documents.worker.insert_financial_statement", new_callable=AsyncMock) as mock_insert,
+        patch("documents.worker.chunk_text", return_value=["chunk"]),
+        patch.object(worker, "_embed_chunks", return_value=[[0.1] * 384]),
+        patch.object(worker, "_upsert_vectors", new_callable=AsyncMock) as mock_upsert,
+    ):
+        await worker.process_document_worker(
+            pool=pool,
+            pinecone_index=MagicMock(),
+            embed_model=MagicMock(encode=MagicMock(return_value=[[0.1] * 384])),
+            document_id="doc-fin-err",
+            file_path="/uploads/doc-fin-err.pdf",
+            owner_id="user-1",
+        )
+
+    status_calls = [c.args[2] for c in mock_status.await_args_list]
+    assert "failed" not in status_calls
+    assert "completed" in status_calls
+    mock_insert.assert_not_awaited()
+    mock_upsert.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_no_financial_data_does_not_insert():
+    """
+    If extract_financial_statement returns None, insert_financial_statement must not be called.
+    """
+    from documents import worker
+
+    pool = MagicMock()
+    pool.execute = AsyncMock()
+
+    with (
+        patch.object(worker, "_extract_text", return_value="קופת גמל דוח שנתי ריק"),
+        patch("documents.worker.classify_document", return_value=("savings_statement", "high")),
+        patch("documents.worker.update_document_classification", new_callable=AsyncMock),
+        patch("documents.worker.update_document_status", new_callable=AsyncMock),
+        patch("documents.worker.extract_financial_statement", return_value=None),
+        patch("documents.worker.insert_financial_statement", new_callable=AsyncMock) as mock_insert,
+        patch("documents.worker.chunk_text", return_value=["chunk"]),
+        patch.object(worker, "_embed_chunks", return_value=[[0.1] * 384]),
+        patch.object(worker, "_upsert_vectors", new_callable=AsyncMock),
+    ):
+        await worker.process_document_worker(
+            pool=pool,
+            pinecone_index=MagicMock(),
+            embed_model=MagicMock(encode=MagicMock(return_value=[[0.1] * 384])),
+            document_id="doc-fin-empty",
+            file_path="/uploads/doc-fin-empty.pdf",
+            owner_id="user-1",
+        )
+
+    mock_insert.assert_not_awaited()

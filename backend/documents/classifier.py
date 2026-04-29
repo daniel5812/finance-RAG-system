@@ -14,6 +14,7 @@ DocType = Literal[
     "portfolio_statement",
     "bank_statement",
     "financial_report",
+    "savings_statement",
     "generic_financial_doc",
     "unknown",
 ]
@@ -23,8 +24,8 @@ Confidence = Literal["high", "medium", "low"]
 # Keywords that strongly indicate a specific document type
 _TYPE_SIGNALS: dict[str, list[str]] = {
     "broker_statement": [
-        "broker", "brokerage", "trade confirmation", "transaction history",
-        "account statement", "commission", "executed trade",
+        "brokerage", "trade confirmation", "transaction history",
+        "commission", "executed trade",
     ],
     "portfolio_statement": [
         "portfolio", "holdings", "investment summary", "asset allocation",
@@ -35,8 +36,15 @@ _TYPE_SIGNALS: dict[str, list[str]] = {
         "deposits", "withdrawals", "bank of", "checking", "savings",
     ],
     "financial_report": [
-        "10-k", "10-q", "annual report", "earnings", "balance sheet",
+        "10-k", "10-q", "annual report", "balance sheet",
         "income statement", "quarterly report", "fiscal year",
+    ],
+    "savings_statement": [
+        "גמל", "קופת גמל", "קופת גמל להשקעה",
+        "השתלמות", "קרן השתלמות",
+        "פנסיה", "קרן פנסיה",
+        "דוח שנתי",
+        "annual savings report", "savings statement", "pension statement",
     ],
 }
 

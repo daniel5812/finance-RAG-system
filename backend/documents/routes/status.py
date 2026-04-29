@@ -64,6 +64,8 @@ async def list_documents(
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             folder_id=r.get("folder_id"),
+            doc_type=r.get("doc_type") or "unknown",
+            classification_confidence=r.get("classification_confidence") or "low",
         )
         for r in rows
     ]
@@ -114,6 +116,8 @@ async def get_document_status(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         folder_id=row.get("folder_id"),
+        doc_type=row.get("doc_type") or "unknown",
+        classification_confidence=row.get("classification_confidence") or "low",
     )
 
 

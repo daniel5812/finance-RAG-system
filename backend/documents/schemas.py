@@ -4,8 +4,21 @@ New models are added here as each stage is implemented.
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, field_validator
+
+# Step 5A: classification taxonomy
+DocType = Literal[
+    "broker_statement",
+    "portfolio_statement",
+    "bank_statement",
+    "financial_report",
+    "savings_statement",
+    "generic_financial_doc",
+    "unknown",
+]
+
+ClassificationConfidence = Literal["high", "medium", "low"]
 
 
 class RoutingResponse(BaseModel):
@@ -42,6 +55,38 @@ class DocumentUploadResponse(BaseModel):
     original_filename: str  # Echo back so the client can confirm the right file
 
 
+class CandidateHoldingResponse(BaseModel):
+    """
+    A single extracted holding candidate from a broker or portfolio statement.
+    source_line is intentionally excluded — internal audit only, never exposed via API.
+    """
+    ticker: str
+    quantity: Optional[float] = None
+    confidence: str  # 'high' | 'low'
+
+
+class FinancialStatementResponse(BaseModel):
+    """
+    Returned by GET /documents/{id}/financial-statement.
+    Reflects structured fields extracted from a savings / pension statement.
+    All fields are optional — partial extraction is a valid success state.
+    """
+    document_id:          str
+    provider:             Optional[str] = None
+    account_type:         Optional[str] = None
+    account_number:       Optional[str] = None
+    report_date:          Optional[str] = None
+    period_start:         Optional[str] = None
+    period_end:           Optional[str] = None
+    ending_balance:       Optional[float] = None
+    annual_deposits:      Optional[float] = None
+    investment_gains:     Optional[float] = None
+    management_fees:      Optional[float] = None
+    track_name:           Optional[str] = None
+    equity_exposure_pct:  Optional[float] = None
+    fx_exposure_pct:      Optional[float] = None
+
+
 class DocumentStatusResponse(BaseModel):
     """
     Returned by GET /documents/{id}.
@@ -59,4 +104,6 @@ class DocumentStatusResponse(BaseModel):
     updated_at: datetime
     storage_path: str | None = None   # only exposed for debugging; hide in production
     folder_id: Optional[int] = None
+    doc_type: DocType = "unknown"
+    classification_confidence: ClassificationConfidence = "low"
 

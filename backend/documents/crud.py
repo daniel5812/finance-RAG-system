@@ -48,6 +48,8 @@ async def get_document_status(pool: asyncpg.Pool, document_id: str) -> Optional[
             key_topics,
             suggested_questions,
             folder_id,
+            doc_type,
+            classification_confidence,
             created_at,
             updated_at
         FROM documents
@@ -108,6 +110,8 @@ async def get_user_documents(
                 key_topics,
                 suggested_questions,
                 folder_id,
+                doc_type,
+                classification_confidence,
                 created_at,
                 updated_at
             FROM documents
@@ -131,6 +135,8 @@ async def get_user_documents(
                 key_topics,
                 suggested_questions,
                 folder_id,
+                doc_type,
+                classification_confidence,
                 created_at,
                 updated_at
             FROM documents
@@ -215,6 +221,190 @@ async def set_document_folder(
         document_id,
         owner_id,
     )
+
+
+# ── Document Classification ──────────────────────────────────────────────────
+
+async def update_document_classification(
+    pool: asyncpg.Pool,
+    document_id: str,
+    doc_type: str,
+    confidence: str,
+) -> None:
+    """Persist classification result after deterministic keyword analysis."""
+    await pool.execute(
+        """
+        UPDATE documents
+        SET doc_type = $1, classification_confidence = $2, updated_at = NOW()
+        WHERE id = $3
+        """,
+        doc_type,
+        confidence,
+        document_id,
+    )
+
+
+# ── Document Holdings ────────────────────────────────────────────────────────
+
+async def insert_document_holdings(
+    pool: asyncpg.Pool,
+    document_id: str,
+    owner_id: str,
+    holdings: list,
+) -> int:
+    """
+    Batch-insert extracted holding candidates.
+
+    Args:
+        holdings: list of CandidateHolding dataclass instances from extractor.py.
+
+    Returns:
+        Number of rows inserted.
+    """
+    rows = [
+        (document_id, owner_id, h.ticker, h.quantity, h.source_line, h.confidence)
+        for h in holdings
+    ]
+    await pool.executemany(
+        """
+        INSERT INTO document_holdings
+            (document_id, owner_id, ticker, quantity, source_line, confidence)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+async def get_document_holdings(
+    pool: asyncpg.Pool,
+    document_id: str,
+    owner_id: str,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all holding candidates for a document, scoped to owner.
+    source_line is excluded — internal audit column, not returned to callers.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT
+            id,
+            document_id::text,
+            owner_id,
+            ticker,
+            quantity,
+            confidence,
+            created_at
+        FROM document_holdings
+        WHERE document_id = $1
+          AND owner_id    = $2
+        ORDER BY created_at ASC
+        """,
+        document_id,
+        owner_id,
+    )
+    return [dict(r) for r in rows]
+
+
+# ── Financial Statement ──────────────────────────────────────────────────────
+
+async def insert_financial_statement(
+    pool: asyncpg.Pool,
+    document_id: str,
+    owner_id: str,
+    data,  # FinancialStatementData — avoid circular import; duck-typed
+) -> None:
+    """
+    Upsert extracted financial statement fields for a document.
+    ON CONFLICT (document_id) re-runs are idempotent — overwrites all fields.
+    owner_id isolation is enforced by the UNIQUE(document_id) constraint plus
+    the WHERE clause on get, not by the insert itself.
+    """
+    await pool.execute(
+        """
+        INSERT INTO document_financial_statements (
+            document_id, owner_id,
+            provider, account_type, account_number,
+            report_date, period_start, period_end,
+            ending_balance, annual_deposits, investment_gains, management_fees,
+            track_name, equity_exposure_pct, fx_exposure_pct
+        ) VALUES (
+            $1, $2,
+            $3, $4, $5,
+            $6::date, $7::date, $8::date,
+            $9, $10, $11, $12,
+            $13, $14, $15
+        )
+        ON CONFLICT (document_id) DO UPDATE SET
+            owner_id            = EXCLUDED.owner_id,
+            provider            = EXCLUDED.provider,
+            account_type        = EXCLUDED.account_type,
+            account_number      = EXCLUDED.account_number,
+            report_date         = EXCLUDED.report_date,
+            period_start        = EXCLUDED.period_start,
+            period_end          = EXCLUDED.period_end,
+            ending_balance      = EXCLUDED.ending_balance,
+            annual_deposits     = EXCLUDED.annual_deposits,
+            investment_gains    = EXCLUDED.investment_gains,
+            management_fees     = EXCLUDED.management_fees,
+            track_name          = EXCLUDED.track_name,
+            equity_exposure_pct = EXCLUDED.equity_exposure_pct,
+            fx_exposure_pct     = EXCLUDED.fx_exposure_pct
+        """,
+        document_id,
+        owner_id,
+        data.provider,
+        data.account_type,
+        data.account_number,
+        data.report_date,
+        data.period_start,
+        data.period_end,
+        data.ending_balance,
+        data.annual_deposits,
+        data.investment_gains,
+        data.management_fees,
+        data.track_name,
+        data.equity_exposure_pct,
+        data.fx_exposure_pct,
+    )
+
+
+async def get_financial_statement(
+    pool: asyncpg.Pool,
+    document_id: str,
+    owner_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch the financial statement record for a document, scoped to owner.
+    Returns None if not found or if owner_id does not match.
+    """
+    row = await pool.fetchrow(
+        """
+        SELECT
+            document_id::text,
+            owner_id,
+            provider,
+            account_type,
+            account_number,
+            report_date::text,
+            period_start::text,
+            period_end::text,
+            ending_balance,
+            annual_deposits,
+            investment_gains,
+            management_fees,
+            track_name,
+            equity_exposure_pct,
+            fx_exposure_pct,
+            created_at
+        FROM document_financial_statements
+        WHERE document_id = $1
+          AND owner_id    = $2
+        """,
+        document_id,
+        owner_id,
+    )
+    return dict(row) if row else None
 
 
 # ── Document Metadata ────────────────────────────────────────────────────────
