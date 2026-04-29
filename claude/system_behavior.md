@@ -298,6 +298,47 @@ Semantic Rewrite
 
 ---
 
+## Macro Signals (Step 4)
+
+**Purpose**: Provide market regime indicators via deterministic FRED data extraction.
+
+**Signal Types & Computation**
+- **VIX (VIXCLS)**: volatility regime indicator
+  - Recent value from latest row + trend direction from recent values
+  - Trend: calculated over available rows; omitted if insufficient history
+- **Yield Curve (T10Y2Y)**: term premium regime indicator
+  - 10Y-2Y spread from latest row + trend direction
+  - Trend: calculated over available rows; omitted if insufficient history
+- **Inflation (CPIAUCNS)**: 3-row CPI trend
+  - Trend label: up | down | stable (based on latest 3 rows if available)
+  - Omitted if fewer than 3 rows in database
+- **Fed Rate (FEDFUNDS)**: 3-row federal funds rate trend
+  - Trend label: up | down | stable (based on latest 3 rows if available)
+  - Omitted if fewer than 3 rows in database
+
+**Computation Location**
+- All signals computed in MarketAnalyzerAgent (Stage 1, no LLM)
+- Pure function: reads macro_series SQL table → deterministic signal extraction
+- No fallback estimation; no LLM-driven trend inference
+
+**Missing-Data Behavior (STRICT)**
+- Missing series entirely (e.g., VIXCLS not in macro_series) → signal absent from context
+- Insufficient rows for trend (e.g., only 1 CPI value) → trend omitted; latest value included
+- Each signal failure is isolated: one series missing does not block others
+- No fake data, no estimation, no fallback chains
+
+**Context Rendering**
+- context_builder renders existing MarketContext fields
+- [MARKET CONTEXT] section includes macro_signals block (only present signals)
+- LLM receives precomputed signals only; no generation or computation role
+
+**Test Coverage**
+- 25 dedicated macro signal tests (backend/tests/test_macro_signals.py)
+- Test variants: complete data, partial rows, missing series, trend edge cases
+- No fallback behavior tested (none implemented)
+
+---
+
 ## Intelligence Layer
 
 Pipeline Stages

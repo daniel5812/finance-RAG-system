@@ -86,6 +86,37 @@ prices, fx_rates, macro_series, filings, etf_holdings, portfolio_positions
 - Orchestrator integration: runs after MarketAnalyzer
 - Tests: 20 passing, 2 fixed (test data coverage alignment)
 
+## Step 4 — Macro Signals (COMPLETE)
+
+**Feature**: Market regime indicators from FRED data
+- **VIX signal**: VIXCLS volatility regime (recent value + trend direction)
+- **Yield curve signal**: T10Y2Y term premium regime (recent value + trend direction)
+- **Inflation trend**: CPIAUCNS latest 3-row trend (up/down/stable)
+- **Fed rate trend**: FEDFUNDS latest 3-row trend (up/down/stable)
+
+**Computation**:
+- All signals computed deterministically in MarketAnalyzerAgent (no LLM)
+- Signals extracted from macro_series SQL table (FRED-sourced data)
+- No schema changes; no orchestrator restructuring
+- Context builder: [MARKET CONTEXT] section includes macro signals when available
+
+**Missing-Data Behavior**:
+- Missing series rows → signal omitted (no fallback estimation)
+- Insufficient trend rows (< 3) → trend omitted
+- No fake data; each signal failure is isolated
+- LLM receives only precomputed macro context (no generation role)
+
+**Data Seeding**:
+- Added VIXCLS and T10Y2Y to macro series seed (backend/financial/providers/macro.py)
+- Existing CPIAUCNS + FEDFUNDS series already in seed
+
+**Implementation** (COMPLETE):
+- MarketAnalyzerAgent: reads macro_series, computes signals deterministically
+- Signal schemas: VIXSignal, YieldCurveSignal (value + trend_label)
+- Context builder: renders existing MarketContext fields (macro_signals)
+- Tests: 25 passing (backend/tests/test_macro_signals.py)
+- Regression suite: 47 tests passing (including benchmark comparison)
+
 ---
 
 ## Architecture
