@@ -46,6 +46,7 @@ def build_intelligence_context(report: IntelligenceReport) -> str:
         f'"has_user_profile": {bool(report.user_profile)}, '
         f'"has_market_context": {bool(report.market_context)}, '
         f'"has_asset_profiles": {bool(report.asset_profiles)}, '
+        f'"has_document_insights": {bool(report.document_insights)}, '
         f'"has_normalized_portfolio": {bool(report.normalized_portfolio)}, '
         f'"has_portfolio_fit": {bool(report.portfolio_fit)}, '
         f'"has_portfolio_gap_analysis": {bool(report.portfolio_gap_analysis)}, '
@@ -144,6 +145,13 @@ def build_intelligence_context(report: IntelligenceReport) -> str:
                 f"{beta_str}{momentum_str}{etf_str}"
                 f"  [data: {ap.data_freshness}, confidence: {ap.source_confidence}]"
             )
+
+    # ── Document Insights ───────────────────────────────────────────────────
+    if report.document_insights:
+        rendered = _render_document_insights(report.document_insights)
+        if rendered:
+            sections.append(_DIVIDER)
+            sections.append(rendered)
 
     # ── Normalized Portfolio (pre-computed financial metrics) ────────────────
     if report.normalized_portfolio:
@@ -410,6 +418,55 @@ def _render_benchmark_comparison(bc: BenchmarkComparison) -> str:
     if bc.data_note:
         lines.append("")
         lines.append(f"  ⚠ {bc.data_note}")
+
+    return "\n".join(lines)
+
+
+def _render_document_insights(doc_insights: dict) -> str:
+    """
+    Render aggregated document signals for LLM consumption.
+    Returns empty string if no meaningful data present.
+    Only includes fields that have non-zero, non-null values.
+    """
+    if not doc_insights:
+        return ""
+
+    lines = ["[DOCUMENT INSIGHTS — extracted from uploaded statements]"]
+
+    # Accounts detected
+    accounts = doc_insights.get("accounts_detected", 0)
+    if accounts > 0:
+        lines.append(f"  Accounts detected: {accounts}")
+
+    # Account types breakdown
+    breakdown = doc_insights.get("account_types_breakdown", {})
+    if breakdown:
+        types_str = ", ".join(f"{t} ({c})" for t, c in sorted(breakdown.items()))
+        lines.append(f"  Account types: {types_str}")
+
+    # Total assets
+    total_assets = doc_insights.get("total_assets_from_docs", 0)
+    if total_assets > 0:
+        lines.append(f"  Total assets (from documents): ${total_assets:,.2f}")
+
+    # Average equity exposure
+    avg_equity = doc_insights.get("avg_equity_exposure")
+    if avg_equity is not None:
+        lines.append(f"  Average equity exposure: {avg_equity:.1f}%")
+
+    # Average FX exposure
+    avg_fx = doc_insights.get("avg_fx_exposure")
+    if avg_fx is not None:
+        lines.append(f"  Average FX exposure: {avg_fx:.1f}%")
+
+    # Latest report date
+    latest_date = doc_insights.get("latest_report_date")
+    if latest_date is not None:
+        lines.append(f"  Latest statement: {latest_date}")
+
+    # Return empty string if only header exists (no actual data fields)
+    if len(lines) == 1:
+        return ""
 
     return "\n".join(lines)
 

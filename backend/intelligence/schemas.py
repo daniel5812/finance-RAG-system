@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import date
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
 from pydantic import BaseModel, Field
 
 
@@ -294,6 +294,7 @@ class IntelligenceReport(BaseModel):
     user_profile: Optional[UserInvestmentProfile] = None
     market_context: Optional[MarketContext] = None
     asset_profiles: list[AssetProfile] = Field(default_factory=list)
+    document_insights: Optional[dict[str, Any]] = None   # aggregated signals from documents (Step 5D)
     portfolio_fit: Optional[PortfolioFitAnalysis] = None
     normalized_portfolio: Optional[NormalizedPortfolio] = None   # pre-computed financial metrics
     portfolio_gap_analysis: Optional[PortfolioGapAnalysis] = None  # sector/class gap vs benchmark
@@ -332,4 +333,5 @@ class IntelligenceReport(BaseModel):
             and not self.asset_profiles
             and not self.normalized_portfolio
             and not self.recommendations
+            and not self.document_insights   # ← להוסיף את זה
         )
