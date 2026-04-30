@@ -74,6 +74,9 @@ _SQL_TEMPLATE_IDS = {
     "portfolio_lookup": "portfolio_lookup_positions",
 }
 
+# Intent types that are purely factual SQL — no advisory reasoning needed
+_FACTUAL_INTENTS = {"fx_rate", "price_lookup", "etf_holdings", "portfolio_lookup", "macro_series"}
+
 # vector doc_type per intent
 _DOC_TYPE_MAP: dict[str, str | None] = {
     "filing_lookup": "filing",
@@ -342,11 +345,20 @@ def build_plan(
             ))
             has_vector = True
 
+    mode_hint: str = "advisory"
+    if (
+        steps
+        and all(s.source_type == "SQL" for s in steps)
+        and all(s.intent_type in _FACTUAL_INTENTS for s in steps)
+    ):
+        mode_hint = "factual"
+
     return HybridQueryPlan(
         steps=steps,
         plan_meta=PlanMeta(
             total_steps=len(steps),
             is_hybrid=has_sql and has_vector,
             fusion_required=has_sql and has_vector or len(steps) > 1,
+            mode_hint=mode_hint,
         ),
     )

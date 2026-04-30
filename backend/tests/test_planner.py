@@ -74,3 +74,60 @@ def test_max_steps_not_exceeded():
         OWNER,
     )
     assert plan.plan_meta.total_steps <= 3
+
+
+# ── mode_hint ─────────────────────────────────────────────────────────────────
+
+def test_mode_hint_fx_rate():
+    plan = build_plan("What is USD to ILS rate?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_mode_hint_price_lookup():
+    plan = build_plan("What is the AAPL stock price?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_mode_hint_etf_holdings():
+    plan = build_plan("What are the top holdings of SPY ETF?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_mode_hint_portfolio_lookup():
+    plan = build_plan("What is in my portfolio?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_mode_hint_macro_series():
+    plan = build_plan("What is the current inflation rate?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_mode_hint_document_lookup_is_advisory():
+    plan = build_plan("Summarize my uploaded document", OWNER)
+    assert plan.plan_meta.mode_hint == "advisory"
+
+
+def test_mode_hint_no_match_is_advisory():
+    plan = build_plan("Hello world", OWNER)
+    assert plan.plan_meta.mode_hint == "advisory"
+
+
+def test_mode_hint_hybrid_sql_plus_vector_is_advisory():
+    plan = build_plan("How does inflation affect bond investors?", OWNER)
+    assert plan.plan_meta.is_hybrid is True
+    assert plan.plan_meta.mode_hint == "advisory"
+
+
+def test_mode_hint_multiple_factual_sql_only():
+    # fx_rate + macro_series — both SQL, both factual → factual
+    plan = build_plan("What is USD to EUR rate and the current inflation rate?", OWNER)
+    all_sql = all(s.source_type == "SQL" for s in plan.steps)
+    assert all_sql
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_mode_hint_invalid_params_become_advisory():
+    # portfolio_lookup with no owner_id fails _resolve_sql → NO_MATCH step → advisory
+    plan = build_plan("What is in my portfolio?", owner_id="")
+    assert plan.plan_meta.mode_hint == "advisory"

@@ -20,6 +20,7 @@ from documents.routing import route_and_search
 from sentence_transformers import SentenceTransformer
 from rag.schemas import ChatQuery
 from core.prompts import CHAT_SYSTEM_PROMPT, CHAT_STREAM_PROMPT, NATURAL_ADVISORY_PROMPT, FACTUAL_HOLDINGS_PROMPT, INTENT_LABELS, PORTFOLIO_CONTEXT_TEMPLATE, CONDENSE_QUESTION_PROMPT, MEM_SUMMARY_PROMPT, SESSION_TITLE_PROMPT, build_conversation_context
+from core.prompt_assembler import PromptAssembler
 from core.session_memory import SessionMemoryStore, SummaryBuilder
 import asyncpg
 from uuid import UUID
@@ -258,6 +259,20 @@ async def fetch_portfolio_context(pool: asyncpg.Pool, owner_id: str | None) -> s
         logger.warning(f"Portfolio context fetch failed: {e}")
         return None
 
+_EXTRACTION_OVERRIDE_PATTERNS = [
+    "מה שאתה כן יודע",
+    "אז תן לי",
+    "מה כן ידוע",
+    "what do you know",
+    "what is available",
+    "what can you tell me",
+]
+
+def _is_extraction_override(question: str) -> bool:
+    q = question.lower()
+    return any(p in q for p in _EXTRACTION_OVERRIDE_PATTERNS)
+
+
 def build_user_message(
     context_block: str,
     question: str,
@@ -278,20 +293,51 @@ def build_user_message(
         parts.append(conversation_context)
 
     if context_block:
+        has_doc_chunks = "[D" in context_block
+        has_sql_chunks = "[S" in context_block
+        if has_doc_chunks and not has_sql_chunks:
+            # Document-only context: allow synthesis and summarization
+            directive = (
+                "[SYSTEM DIRECTIVE]: "
+                "These are retrieved document chunks. "
+                "You MAY synthesize, summarize, and reason from them directly. "
+                "CITATION FORMAT: always 'value [D#]' with a space — e.g. '27,949 [D1]' — NEVER '27,949D1'. "
+                "TEMPORAL GROUNDING: Only pair a value with a date if they appear together in the same chunk. "
+                "If the user asks about year X but the chunk date is Y, state the value with date Y. "
+                "NEVER assign a value to a year not present in the same chunk. "
+                "Do NOT perform arithmetic on numeric values."
+            )
+        else:
+            # SQL or mixed context: cite-only, no arithmetic
+            directive = (
+                "[SYSTEM DIRECTIVE]: "
+                "CITE figures, dates, and statements from the above context using [S#] or [D#] tags. "
+                "FORMAT: always write 'value [S#]' or 'value [D#]' with a space before the bracket — NEVER 'valueS#' or 'valueD#'. "
+                "Do NOT perform arithmetic on these values. "
+                "If a number appears here but NOT in the INVESTMENT INTELLIGENCE LAYER block, "
+                "cite it as-is and do NOT derive totals, ratios, or percentages from it."
+            )
         parts.append(
-            "--- BEGIN RETRIEVED CONTEXT (cite-only, do NOT compute from this) ---\n"
+            "--- BEGIN RETRIEVED CONTEXT ---\n"
             f"{context_block}\n"
             "--- END RETRIEVED CONTEXT ---\n"
-            "[SYSTEM DIRECTIVE]: "
-            "CITE figures, dates, and statements from the above context using [S#] or [D#] tags. "
-            "Do NOT perform arithmetic on these values. "
-            "If a number appears here but NOT in the INVESTMENT INTELLIGENCE LAYER block, "
-            "cite it as-is and do NOT derive totals, ratios, or percentages from it."
+            f"{directive}"
         )
     if portfolio_ctx:
         parts.append(portfolio_ctx)
     parts.append(f"[Intent: {intent}]")
     parts.append(f"Question:\n{question}")
+    if _is_extraction_override(question):
+        parts.append(
+            "[EXTRACTION OVERRIDE ACTIVE]: The user is asking for all available information "
+            "after a previous missing-data response. "
+            "You MUST switch to extraction mode: list ALL facts present in the retrieved [D#] chunks. "
+            "For each value, cite its actual date from the chunk — do NOT reuse the year from the previous question. "
+            "e.g. 'הנתון הזמין הוא 27,949 נכון ל-31/03/2025 [D1]' — NOT 'היתרה ב-2023'. "
+            "CITATION FORMAT: always 'value [D#]' with a space — NEVER 'valueD#'. "
+            "Do NOT repeat missing-data limitations as the main answer. "
+            "If data is truly absent, mention it in ONE final sentence only."
+        )
     return "\n\n".join(parts)
 
 async def regenerate_response(pinecone_index: Any, question: str, cache_key: str, user_role: str = "employee"):
@@ -901,9 +947,6 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
     conversation_context = build_conversation_context(history_summary)
 
-    user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
-                                      intelligence_block=intelligence_block,
-                                      conversation_context=conversation_context)
     t_gen = time.time()
 
     # 🔹 6. Context Flags for Guidance Layer
@@ -925,22 +968,51 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
             logger.warning(f"Failed to check document count: {e}")
 
     # 🔹 7. Prepend Flags to System Prompt
-    # Select prompt based on whether intelligence layer ran
-    response_prompt = NATURAL_ADVISORY_PROMPT if not _skip_intelligence else FACTUAL_HOLDINGS_PROMPT
-    system_content = (
-        f"CONTEXT_FLAGS:\n"
-        f"HAS_CONTEXT={has_context}\n"
-        f"HAS_DOCUMENTS={has_any_docs}\n"
-        f"HAS_PORTFOLIO={has_portfolio}\n"
-        f"IS_NEW_SESSION={is_new_session}\n\n"
-        f"{response_prompt}"
-    )
-    messages = [{"role": "system", "content": system_content}]
+    if PROMPT_ASSEMBLY_V2:
+        _asm = PromptAssembler.build(
+            mode_hint=hybrid_plan.plan_meta.mode_hint,
+            context_block=context_block,
+            intelligence_block=intelligence_block,
+            conversation_context=conversation_context,
+            question=standalone_question,
+            intent=intent,
+            portfolio_ctx=portfolio_ctx,
+            has_context=has_context,
+            has_any_docs=has_any_docs,
+            has_portfolio=has_portfolio,
+            is_new_session=is_new_session,
+        )
+        messages = [_asm[0]]
+        logger.info(json.dumps({
+            "event": "prompt_assembly_v2_active",
+            "version": PromptAssembler.PROMPT_VERSION,
+            "mode_hint": hybrid_plan.plan_meta.mode_hint,
+        }))
+        # V2: mode_hint is the single source of truth for factual vs advisory
+        _inject_profile = (hybrid_plan.plan_meta.mode_hint != "factual")
+    else:
+        # Legacy path — unchanged
+        user_message = build_user_message(context_block, standalone_question, intent, portfolio_ctx,
+                                          intelligence_block=intelligence_block,
+                                          conversation_context=conversation_context)
+        response_prompt = NATURAL_ADVISORY_PROMPT if not _skip_intelligence else FACTUAL_HOLDINGS_PROMPT
+        system_content = (
+            f"CONTEXT_FLAGS:\n"
+            f"HAS_CONTEXT={has_context}\n"
+            f"HAS_DOCUMENTS={has_any_docs}\n"
+            f"HAS_PORTFOLIO={has_portfolio}\n"
+            f"IS_NEW_SESSION={is_new_session}\n\n"
+            f"{response_prompt}"
+        )
+        messages = [{"role": "system", "content": system_content}]
+        # Legacy: _skip_intelligence guards advisory/profile blocks (etf_holdings + portfolio_lookup only)
+        _inject_profile = not _skip_intelligence
 
     # 🔹 6. Personalization: User Profile Injection (Stage: Proactive Advisor)
     # user_profile was already fetched early (before intelligence layer) — reuse it here
-    # Skip profile block for factual queries (_skip_intelligence=True) to avoid advisory language leakage
-    if query.owner_id and user_profile and not _skip_intelligence:
+    # V2: suppressed for all factual mode_hint intents via _inject_profile
+    # Legacy: suppressed only when _skip_intelligence=True (etf_holdings, portfolio_lookup)
+    if query.owner_id and user_profile and _inject_profile:
         try:
             profile_block = UserProfileService.format_profile_for_prompt(user_profile)
             messages.append({"role": "system", "content": profile_block})
@@ -969,7 +1041,11 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
         for m in query.history[-6:]:
             messages.append({"role": m.role, "content": m.content})
     
-    messages.append({"role": "user", "content": user_message})
+    if PROMPT_ASSEMBLY_V2:
+        messages.append(_asm[1])
+        user_message = _asm[1]["content"]  # satisfy downstream size metrics
+    else:
+        messages.append({"role": "user", "content": user_message})
 
     # 🔹 Save User Message to DB
     if query.session_id:
@@ -1462,29 +1538,53 @@ async def _build_prompt_stage(
     standalone_question: str, guidance: dict, retrieval: dict,
 ) -> list[dict]:
     """System prompt, user message, history summary → final stream_messages list."""
-    response_prompt = NATURAL_ADVISORY_PROMPT if not guidance.get('_skip_intelligence', False) else FACTUAL_HOLDINGS_PROMPT
-    # Omit profile block for factual queries to prevent advisory language leakage
-    profile_section = "" if guidance.get('_skip_intelligence', False) else guidance['profile_block']
-    system_content = (
-        f"CONTEXT_FLAGS:\n"
-        f"HAS_CONTEXT={guidance['has_context']}\n"
-        f"HAS_DOCUMENTS={guidance['has_any_docs']}\n"
-        f"HAS_PORTFOLIO={guidance['has_portfolio']}\n"
-        f"IS_NEW_SESSION={guidance['is_new_session']}\n\n"
-        f"{profile_section}"
-        f"{response_prompt}"
-    )
     history_summary = await get_memory(pool, query.session_id, query.owner_id, query.history)
     conversation_context = build_conversation_context(history_summary)
 
-    user_message = build_user_message(
-        retrieval["context_block"], standalone_question,
-        guidance["intent"], guidance["portfolio_ctx"],
-        intelligence_block=guidance["intelligence_block"],
-        conversation_context=conversation_context,
-    )
+    if PROMPT_ASSEMBLY_V2:
+        _mode_hint = (
+            getattr(getattr(retrieval["hybrid_plan"], "plan_meta", None), "mode_hint", None)
+            or "advisory"
+        )
+        _asm = PromptAssembler.build(
+            mode_hint=_mode_hint,
+            context_block=retrieval["context_block"],
+            intelligence_block=guidance["intelligence_block"],
+            conversation_context=conversation_context,
+            question=standalone_question,
+            intent=guidance["intent"],
+            portfolio_ctx=guidance["portfolio_ctx"],
+            has_context=guidance["has_context"],
+            has_any_docs=guidance["has_any_docs"],
+            has_portfolio=guidance["has_portfolio"],
+            is_new_session=guidance["is_new_session"],
+        )
+        stream_messages = [_asm[0]]
+        logger.info(json.dumps({
+            "event": "prompt_assembly_v2_active",
+            "version": PromptAssembler.PROMPT_VERSION,
+            "mode_hint": _mode_hint,
+        }))
+        # V2: mode_hint is the single source of truth for factual vs advisory
+        _inject_profile = (_mode_hint != "factual")
+        if guidance.get("user_profile") and _inject_profile:
+            stream_messages.append({"role": "system", "content": guidance["profile_block"]})
+    else:
+        # Legacy path — unchanged
+        response_prompt = NATURAL_ADVISORY_PROMPT if not guidance.get('_skip_intelligence', False) else FACTUAL_HOLDINGS_PROMPT
+        # Omit profile block for factual queries to prevent advisory language leakage
+        profile_section = "" if guidance.get('_skip_intelligence', False) else guidance['profile_block']
+        system_content = (
+            f"CONTEXT_FLAGS:\n"
+            f"HAS_CONTEXT={guidance['has_context']}\n"
+            f"HAS_DOCUMENTS={guidance['has_any_docs']}\n"
+            f"HAS_PORTFOLIO={guidance['has_portfolio']}\n"
+            f"IS_NEW_SESSION={guidance['is_new_session']}\n\n"
+            f"{profile_section}"
+            f"{response_prompt}"
+        )
+        stream_messages = [{"role": "system", "content": system_content}]
 
-    stream_messages = [{"role": "system", "content": system_content}]
     if history_summary:
         stream_messages.append({"role": "system", "content": f"Context Summary of previous conversation:\n{history_summary}"})
         for m in query.history[-3:]:
@@ -1492,10 +1592,28 @@ async def _build_prompt_stage(
     else:
         for m in query.history[-6:]:
             stream_messages.append({"role": m.role, "content": m.content})
-    stream_messages.append({"role": "user", "content": user_message})
 
-    logger.info(json.dumps({"event": "stage_prompt_complete", "message_count": len(stream_messages),
-                             "has_history_summary": bool(history_summary)}))
+    if PROMPT_ASSEMBLY_V2:
+        stream_messages.append(_asm[1])
+    else:
+        user_message = build_user_message(
+            retrieval["context_block"], standalone_question,
+            guidance["intent"], guidance["portfolio_ctx"],
+            intelligence_block=guidance["intelligence_block"],
+            conversation_context=conversation_context,
+        )
+        stream_messages.append({"role": "user", "content": user_message})
+
+    _ctx_block = retrieval["context_block"]
+    _user_msg_content = _asm[1].get("content", "") if PROMPT_ASSEMBLY_V2 else user_message
+    logger.info(json.dumps({
+        "event": "stage_prompt_complete",
+        "message_count": len(stream_messages),
+        "has_history_summary": bool(history_summary),
+        "has_retrieved_context": bool(_ctx_block),
+        "context_chars": len(_ctx_block),
+        "prompt_includes_context": bool(_ctx_block) and "BEGIN RETRIEVED CONTEXT" in _user_msg_content,
+    }))
     return stream_messages
 
 
@@ -1813,3 +1931,102 @@ async def generate_stream_response(
             "exception": str(e),
             "message": "Crash in prepare/retrieval/guidance stages",
         }))
+
+
+# ── Debug dry-run (no LLM) ────────────────────────────────────────────────────
+
+async def run_debug_dry_run(
+    pool: asyncpg.Pool,
+    pinecone_index: Any,
+    embed_model: SentenceTransformer,
+    rerank_model: Any,
+    query: ChatQuery,
+) -> "DebugDryRunResponse":
+    """
+    Run plan → execute → fuse without calling the LLM, intelligence layer,
+    or writing any profile state. Returns a DebugDryRunResponse.
+    """
+    from rag.schemas import (
+        DebugDryRunResponse, PlanStepDebug, StepResultDebug,
+        FusionDebugSummary, DebugLatencyBreakdown,
+    )
+
+    t0 = time.time()
+
+    t_condense = time.time()
+    standalone_question = await condense_question(query.history, query.question)
+    condense_ms = (time.time() - t_condense) * 1000
+
+    loop = asyncio.get_running_loop()
+
+    t_plan = time.time()
+    plan = _hybrid_build_plan(standalone_question, query.owner_id or "")
+    plan_ms = (time.time() - t_plan) * 1000
+
+    t_exec = time.time()
+    step_results = await _hybrid_execute_plan(
+        plan, query.owner_id or "",
+        sql_runner=_make_sql_runner(pool),
+        vector_runner=_make_vector_runner(
+            standalone_question, pool, pinecone_index, embed_model, rerank_model, query, loop
+        ),
+    )
+    execute_ms = (time.time() - t_exec) * 1000
+
+    fusion_result = _hybrid_fuse(plan, step_results)
+    total_ms = (time.time() - t0) * 1000
+
+    plan_steps_debug = [
+        PlanStepDebug(
+            step_id=s.step_id,
+            source_type=s.source_type,
+            intent_type=s.intent_type,
+            sql_template_id=s.sql_template_id,
+            execution_mode=s.execution_mode,
+        )
+        for s in plan.steps
+    ]
+
+    step_results_debug = [
+        StepResultDebug(
+            step_id=r.step_id,
+            intent_type=r.intent_type,
+            source_type=r.source_type,
+            status=r.status,
+            row_count=len(r.data),
+            error_message=r.error_message,
+        )
+        for r in step_results
+    ]
+
+    fusion_summary = FusionDebugSummary(
+        has_sql=fusion_result.retrieval_summary.has_sql,
+        has_vector=fusion_result.retrieval_summary.has_vector,
+        is_partial=fusion_result.retrieval_summary.is_partial,
+        missing_data_notes=fusion_result.missing_data_notes,
+        structured_data_keys={k: len(v) for k, v in fusion_result.structured_data.items()},
+        supporting_context_count=len(fusion_result.supporting_context),
+    )
+
+    logger.info(json.dumps({
+        "event": "debug_dry_run_complete",
+        "owner_id_exists": bool(query.owner_id),
+        "total_steps": plan.plan_meta.total_steps,
+        "is_hybrid": plan.plan_meta.is_hybrid,
+        "is_partial": fusion_summary.is_partial,
+        "total_ms": round(total_ms, 1),
+    }))
+
+    return DebugDryRunResponse(
+        standalone_question=standalone_question,
+        plan_steps=plan_steps_debug,
+        plan_meta=plan.plan_meta,
+        step_results=step_results_debug,
+        fusion_summary=fusion_summary,
+        latency_ms=DebugLatencyBreakdown(
+            condense_ms=round(condense_ms, 1),
+            plan_ms=round(plan_ms, 1),
+            execute_ms=round(execute_ms, 1),
+            total_ms=round(total_ms, 1),
+        ),
+    )

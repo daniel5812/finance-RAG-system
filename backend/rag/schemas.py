@@ -109,6 +109,7 @@ class PlanMeta(BaseModel):
     total_steps: int
     is_hybrid: bool
     fusion_required: bool
+    mode_hint: Literal["factual", "advisory"] = "advisory"
 
 class HybridQueryPlan(BaseModel):
     steps: List[PlanStep]
@@ -133,3 +134,43 @@ class FusionResult(BaseModel):
     supporting_context: List[Any] = []
     missing_data_notes: List[str] = []
     retrieval_summary: RetrievalSummary
+
+
+# ── Debug dry-run schemas ─────────────────────────────────────────────────────
+
+class PlanStepDebug(BaseModel):
+    step_id: int
+    source_type: str
+    intent_type: str
+    sql_template_id: Optional[str]
+    execution_mode: str
+
+class StepResultDebug(BaseModel):
+    step_id: int
+    intent_type: str
+    source_type: str
+    status: str  # ok | empty | error
+    row_count: int
+    error_message: Optional[str] = None
+
+class FusionDebugSummary(BaseModel):
+    has_sql: bool
+    has_vector: bool
+    is_partial: bool
+    missing_data_notes: List[str]
+    structured_data_keys: Dict[str, int]  # intent_type → row_count
+    supporting_context_count: int
+
+class DebugLatencyBreakdown(BaseModel):
+    condense_ms: float
+    plan_ms: float
+    execute_ms: float
+    total_ms: float
+
+class DebugDryRunResponse(BaseModel):
+    standalone_question: str
+    plan_steps: List[PlanStepDebug]
+    plan_meta: PlanMeta
+    step_results: List[StepResultDebug]
+    fusion_summary: FusionDebugSummary
+    latency_ms: DebugLatencyBreakdown
