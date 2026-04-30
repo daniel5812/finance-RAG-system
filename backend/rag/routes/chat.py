@@ -11,7 +11,7 @@ from core.middleware import verify_prompt_injection
 import core.state as state
 from core.config import MAX_CONCURRENT_STREAMS
 
-from rag.schemas import ChatQuery
+from rag.schemas import ChatQuery, DebugDryRunResponse
 from rag.services import chat_service
 logger = get_logger(__name__)
 # Apply the security check globally to all endpoints in this router
@@ -33,6 +33,20 @@ async def chat_with_data(
     """Sync endpoint — returns full response JSON."""
     query.owner_id = user_id
     return await chat_service.generate_chat_response(pool, pinecone_index, embed_model, rerank_model, query)
+
+
+@router.post("/chat/debug", response_model=DebugDryRunResponse)
+async def chat_debug_dry_run(
+    query: ChatQuery,
+    user_id: str = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    pinecone_index: Any = Depends(get_pinecone),
+    embed_model: SentenceTransformer = Depends(get_embed_model),
+    rerank_model: Any = Depends(get_rerank_model),
+):
+    """Dry-run: planner → executor → fusion. No LLM, no intelligence layer."""
+    query.owner_id = user_id
+    return await chat_service.run_debug_dry_run(pool, pinecone_index, embed_model, rerank_model, query)
 
 
 @router.post("/chat/stream")
