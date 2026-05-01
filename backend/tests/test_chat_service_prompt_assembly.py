@@ -197,8 +197,8 @@ def test_assembler_factual_branch_uses_factual_prompt():
     assert "FACTUAL_HOLDINGS_PROMPT" in _ASSEMBLER
 
 
-def test_assembler_prompt_version_is_phase1b():
-    assert "phase1b" in _ASSEMBLER
+def test_assembler_prompt_version_is_phase3a():
+    assert "phase3a" in _ASSEMBLER
 
 
 # ── Phase 2A — mode_hint consistency & build_user_message gating ─────────────
