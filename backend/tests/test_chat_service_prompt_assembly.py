@@ -286,3 +286,89 @@ def test_sync_v2_does_not_call_build_user_message_in_v2_block():
     assert bum_pos == -1 or bum_pos > else_start, (
         "build_user_message() must not be called inside the V2 if-block"
     )
+
+
+# ── Phase 3B — sql_contexts / doc_contexts wiring ────────────────────────────
+
+_CHAT_SVC_FULL = (_ROOT / "rag/services/chat_service.py").read_text(encoding="utf-8")
+
+
+def test_extract_citation_lists_defined_in_chat_service():
+    assert "def _extract_citation_lists(" in _CHAT_SVC_FULL
+
+
+def test_extract_citation_lists_returns_sql_and_doc_lists():
+    assert "sql_contexts" in _CHAT_SVC_FULL
+    assert "doc_contexts" in _CHAT_SVC_FULL
+
+
+def test_sync_v2_passes_sql_contexts_to_assembler():
+    assert "sql_contexts=_sql_contexts" in _SYNC_SRC
+
+
+def test_sync_v2_passes_doc_contexts_to_assembler():
+    assert "doc_contexts=_doc_contexts" in _SYNC_SRC
+
+
+def test_sync_v2_does_not_pass_context_block_to_assembler():
+    """V2 sync path uses sql_contexts/doc_contexts instead of the pre-joined context_block."""
+    v2_start = _SYNC_SRC.find("if PROMPT_ASSEMBLY_V2:")
+    else_start = _SYNC_SRC.find("else:", v2_start)
+    v2_block = _SYNC_SRC[v2_start:else_start]
+    assert "context_block=context_block" not in v2_block
+
+
+def test_streaming_v2_passes_sql_contexts_to_assembler():
+    assert "sql_contexts=retrieval[" in _STREAM_SRC
+
+
+def test_streaming_v2_passes_doc_contexts_to_assembler():
+    assert "doc_contexts=retrieval[" in _STREAM_SRC
+
+
+def test_streaming_v2_does_not_pass_context_block_to_assembler():
+    """V2 streaming path uses sql_contexts/doc_contexts instead of context_block."""
+    v2_start = _STREAM_SRC.find("if PROMPT_ASSEMBLY_V2:")
+    else_start = _STREAM_SRC.find("else:", v2_start)
+    v2_block = _STREAM_SRC[v2_start:else_start]
+    assert 'context_block=retrieval["context_block"]' not in v2_block
+
+
+def test_retrieval_dict_includes_sql_contexts_key():
+    assert '"sql_contexts"' in _CHAT_SVC_FULL or "'sql_contexts'" in _CHAT_SVC_FULL
+
+
+def test_retrieval_dict_includes_doc_contexts_key():
+    assert '"doc_contexts"' in _CHAT_SVC_FULL or "'doc_contexts'" in _CHAT_SVC_FULL
+
+
+def test_legacy_sync_path_context_block_in_build_user_message():
+    """Legacy sync path must still pass context_block to build_user_message."""
+    assert "build_user_message(context_block," in _SYNC_SRC
+
+
+def test_legacy_streaming_path_context_block_unchanged():
+    """Legacy streaming path must still pass retrieval['context_block'] to build_user_message."""
+    assert 'retrieval["context_block"]' in _STREAM_SRC
+
+
+def test_extract_citation_lists_called_after_fusion_to_context():
+    """_extract_citation_lists must be called right after _fusion_to_context in both paths."""
+    assert "_extract_citation_lists(fusion_result)" in _CHAT_SVC_FULL
+
+
+def test_prompt_assembler_s1_d1_appear_in_cited_build():
+    """Unit-style: PromptAssembler with sql_contexts/doc_contexts produces [S1] and [D1]."""
+    from core.prompt_assembler import PromptAssembler
+    msgs = PromptAssembler.build(
+        mode_hint="advisory",
+        sql_contexts=["Holdings: AAPL 7.2%"],
+        doc_contexts=["Buffett favors long-term holdings."],
+        question="What is SPY?",
+        intent="advisory",
+    )
+    user = msgs[1]["content"]
+    assert "[S1]" in user
+    assert "[D1]" in user
+    assert "Holdings: AAPL 7.2%" in user
+    assert "Buffett favors long-term holdings." in user

@@ -513,6 +513,34 @@ def _fusion_to_context(fusion_result) -> tuple:
     return contexts, sources, citations, metrics
 
 
+def _extract_citation_lists(fusion_result) -> tuple[list[str], list[str]]:
+    """Return (sql_contexts, doc_contexts) as plain text strings without tag prefixes.
+
+    Called alongside _fusion_to_context when PROMPT_ASSEMBLY_V2=true so that
+    PromptAssembler can assign independent [S#] / [D#] counters.  The ordering
+    mirrors _fusion_to_context (SQL first, docs second) for stable assignments.
+    """
+    sql_contexts: list[str] = []
+    doc_contexts: list[str] = []
+
+    for intent_type, rows in (fusion_result.structured_data or {}).items():
+        label = _SQL_LABEL_MAP.get(intent_type, "Financial Data")
+        row_limit = 20 if intent_type == "etf_holdings" else 3
+        sql_contexts.append(
+            f"{label} Result:\n{_format_sql_rows_as_text(rows, max_rows=row_limit)}"
+        )
+
+    for chunk in (fusion_result.supporting_context or []):
+        if not isinstance(chunk, dict):
+            continue
+        meta = chunk.get("metadata", {}) or {}
+        text = meta.get("text") or chunk.get("text", "")
+        if text:
+            doc_contexts.append(text)
+
+    return sql_contexts, doc_contexts
+
+
 async def execute_sub_query(pool, pinecone_index, embed_model, rerank_model, plan, query: ChatQuery, loop, user_role: str):
     sql_time = 0.0
     embed_time = 0.0
@@ -792,6 +820,7 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     retrieval_time = time.time() - t_ret_start
 
     relevant_contexts, sources, citations, metrics = _fusion_to_context(fusion_result)
+    _sql_contexts, _doc_contexts = _extract_citation_lists(fusion_result)
 
     # ─ After Context Assembly: High-signal routing & context metadata ─
     has_sql_context = any(s.get("source_type") == "sql" for s in sources)
@@ -971,7 +1000,8 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     if PROMPT_ASSEMBLY_V2:
         _asm = PromptAssembler.build(
             mode_hint=hybrid_plan.plan_meta.mode_hint,
-            context_block=context_block,
+            sql_contexts=_sql_contexts,
+            doc_contexts=_doc_contexts,
             intelligence_block=intelligence_block,
             conversation_context=conversation_context,
             question=standalone_question,
@@ -1425,6 +1455,7 @@ async def _run_retrieval_stage(
     retrieval_time = time.time() - t_ret
 
     relevant_contexts, sources, citations, metrics = _fusion_to_context(fusion_result)
+    _sql_ctx, _doc_ctx = _extract_citation_lists(fusion_result)
 
     # Contract guards
     if not isinstance(sources, list):
@@ -1447,6 +1478,7 @@ async def _run_retrieval_stage(
         "retrieval_time": retrieval_time, "relevant_contexts": relevant_contexts,
         "sources": sources, "citations": citations, "metrics": metrics,
         "context_block": context_block,
+        "sql_contexts": _sql_ctx, "doc_contexts": _doc_ctx,
     }
 
 
@@ -1548,7 +1580,8 @@ async def _build_prompt_stage(
         )
         _asm = PromptAssembler.build(
             mode_hint=_mode_hint,
-            context_block=retrieval["context_block"],
+            sql_contexts=retrieval["sql_contexts"],
+            doc_contexts=retrieval["doc_contexts"],
             intelligence_block=guidance["intelligence_block"],
             conversation_context=conversation_context,
             question=standalone_question,
