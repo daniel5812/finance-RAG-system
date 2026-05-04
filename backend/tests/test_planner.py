@@ -131,3 +131,140 @@ def test_mode_hint_invalid_params_become_advisory():
     # portfolio_lookup with no owner_id fails _resolve_sql → NO_MATCH step → advisory
     plan = build_plan("What is in my portfolio?", owner_id="")
     assert plan.plan_meta.mode_hint == "advisory"
+
+
+# ── Phase 4A: QueryUnderstanding-augmented planner tests ──────────────────────
+
+def test_qu_advisory_tone_entity_not_factual():
+    """'מה הסיפור עם אפל?' — advisory tone with entity must not produce factual SQL."""
+    plan = build_plan("מה הסיפור עם אפל?", OWNER)
+    assert plan.plan_meta.mode_hint == "advisory"
+    assert all(s.source_type != "SQL" for s in plan.steps)
+
+
+def test_qu_advisory_tone_spy_not_etf_holdings():
+    """'מה אתה חושב על אסאנפי?' — advisory tone must not produce etf_holdings SQL."""
+    plan = build_plan("מה אתה חושב על אסאנפי?", OWNER)
+    assert plan.plan_meta.mode_hint == "advisory"
+    assert all(s.intent_type != "etf_holdings" for s in plan.steps)
+
+
+def test_qu_existing_factual_paths_preserved():
+    """Existing factual paths must not regress after QU integration."""
+    plan = build_plan("What is USD to ILS rate?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    assert plan.steps[0].source_type == "SQL"
+    assert plan.steps[0].intent_type == "fx_rate"
+
+
+def test_qu_existing_price_lookup_preserved():
+    plan = build_plan("What is the AAPL stock price?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    s = plan.steps[0]
+    assert s.intent_type == "price_lookup"
+    assert s.parameters["ticker"] == "AAPL"
+
+
+def test_qu_existing_etf_holdings_preserved():
+    plan = build_plan("What are the top holdings of SPY ETF?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    s = plan.steps[0]
+    assert s.intent_type == "etf_holdings"
+    assert s.parameters["symbol"] == "SPY"
+
+
+def test_qu_vague_query_is_advisory():
+    """Highly ambiguous query must remain advisory/no_match."""
+    plan = build_plan("תראה לי את זה", OWNER)
+    assert plan.plan_meta.mode_hint == "advisory"
+    assert all(s.source_type != "SQL" for s in plan.steps)
+
+
+# ── Phase 4A: free-form runtime regressions ──────────────────────────────────
+
+def test_qu_euro_exchange_eur_ils_factual():
+    """'what is the euro exchange rate?' → fx_rate EUR/ILS, factual."""
+    plan = build_plan("what is the euro exchange rate?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "fx_rate"
+    assert s.parameters["base"] == "EUR"
+    assert s.parameters["quote"] == "ILS"
+
+
+def test_qu_euro_vs_shekel_hebrew_factual():
+    """'מה שער החליפין של היורו מול השקל' → fx_rate EUR/ILS, not USD/ILS."""
+    plan = build_plan("מה שער החליפין של היורו מול השקל", OWNER)
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "fx_rate"
+    assert s.parameters["base"] == "EUR"
+    assert s.parameters["quote"] == "ILS"
+
+
+def test_qu_apple_hebrew_price_lookup():
+    """'כמה המנייה של אפל שווה' → SQL price_lookup AAPL, factual."""
+    plan = build_plan("כמה המנייה של אפל שווה", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "price_lookup"
+    assert s.parameters["ticker"] == "AAPL"
+
+
+def test_qu_tesla_english_price_lookup():
+    """'what is Tesla stock price?' → SQL price_lookup TSLA, factual."""
+    plan = build_plan("what is Tesla stock price?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "price_lookup"
+    assert s.parameters["ticker"] == "TSLA"
+
+
+def test_qu_hebrew_spy_holdings_factual():
+    """'מה יש בתוך SPY?' → SQL etf_holdings SPY, factual."""
+    plan = build_plan("מה יש בתוך SPY?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "etf_holdings"
+    assert s.parameters["symbol"] == "SPY"
+
+
+def test_qu_hebrew_unemployment_macro_factual():
+    """'מה קורה עם האבטלה?' → macro_series UNRATE, factual."""
+    plan = build_plan("מה קורה עם האבטלה?", OWNER)
+    assert plan.plan_meta.mode_hint == "factual"
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "macro_series"
+    assert s.parameters["series_id"] == "UNRATE"
+
+
+def test_qu_uploaded_quarterly_report_routes_to_document():
+    """'יש לך גישה לדוח ריבעוני שהעליתי?' → vector/document, not macro/SQL."""
+    plan = build_plan("יש לך גישה לדוח ריבעוני שהעליתי?", OWNER)
+    assert all(s.source_type != "SQL" for s in plan.steps)
+    intents = {s.intent_type for s in plan.steps}
+    assert "macro_series" not in intents
+    # at least one step routes to document or vector path
+    assert any(s.intent_type == "document_lookup" or s.source_type == "VECTOR" for s in plan.steps)
+
+
+def test_qu_what_do_you_think_nvda_not_factual_price():
+    """'what do you think about NVDA?' → not factual price_lookup."""
+    plan = build_plan("what do you think about NVDA?", OWNER)
+    assert all(s.intent_type != "price_lookup" for s in plan.steps)
+    assert plan.plan_meta.mode_hint == "advisory"
+
+
+def test_qu_existing_usd_to_eur_preserved():
+    """'What is USD to EUR rate?' → SQL fx_rate USD/EUR, factual."""
+    plan = build_plan("What is USD to EUR rate?", OWNER)
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "fx_rate"
+    assert s.parameters["base"] == "USD"
+    assert s.parameters["quote"] == "EUR"

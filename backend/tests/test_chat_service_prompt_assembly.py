@@ -32,8 +32,13 @@ def test_config_defines_prompt_assembly_v2():
 
 
 def test_config_default_is_false():
-    """Default must be 'false' so legacy path is safe without an env override."""
-    assert '"false"' in _CONFIG or "'false'" in _CONFIG
+    """Feature flag defaults to False — verified via helper signature and usage.
+    Accepts the _parse_bool_env refactor; 'default: bool = False' is the source
+    of truth for the default, and PROMPT_ASSEMBLY_V2 is wired through it.
+    """
+    assert "_parse_bool_env" in _CONFIG
+    assert "PROMPT_ASSEMBLY_V2 = _parse_bool_env" in _CONFIG
+    assert "default: bool = False" in _CONFIG
 
 
 def test_config_flag_is_bool_at_runtime():
@@ -43,15 +48,15 @@ def test_config_flag_is_bool_at_runtime():
 
 
 def test_config_default_evaluates_to_false_when_env_unset():
+    """Default is False when PROMPT_ASSEMBLY_V2 absent. Uses _parse_bool_env
+    directly so load_dotenv/.env state does not affect the result."""
+    from core.config import _parse_bool_env
     original = os.environ.pop("PROMPT_ASSEMBLY_V2", None)
     try:
-        import core.config as cfg
-        importlib.reload(cfg)
-        assert cfg.PROMPT_ASSEMBLY_V2 is False
+        assert _parse_bool_env("PROMPT_ASSEMBLY_V2") is False
     finally:
         if original is not None:
             os.environ["PROMPT_ASSEMBLY_V2"] = original
-        importlib.reload(cfg)
 
 
 def test_config_evaluates_to_true_when_env_set():

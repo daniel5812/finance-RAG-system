@@ -127,18 +127,18 @@ def test_prompt_assembly_v2_flag_exists_in_config():
 
 
 def test_prompt_assembly_v2_default_is_false():
-    """Default must be False so legacy path is active without explicit opt-in."""
+    """Default must be False when PROMPT_ASSEMBLY_V2 is absent from the environment.
+
+    Tests _parse_bool_env directly so load_dotenv/.env state is irrelevant.
+    """
     import os
-    import importlib
+    from core.config import _parse_bool_env
     original = os.environ.pop("PROMPT_ASSEMBLY_V2", None)
     try:
-        import core.config as cfg
-        importlib.reload(cfg)
-        assert cfg.PROMPT_ASSEMBLY_V2 is False
+        assert _parse_bool_env("PROMPT_ASSEMBLY_V2") is False
     finally:
         if original is not None:
             os.environ["PROMPT_ASSEMBLY_V2"] = original
-        importlib.reload(cfg)
 
 
 # ── Phase 3A — Citation assignment helpers ────────────────────────────────────

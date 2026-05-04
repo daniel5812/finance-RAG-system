@@ -77,6 +77,31 @@ def is_numeric_shortcut(question: str) -> bool:
     """
     return bool(_NUMERIC_SHORTCUT_RE.match(question.strip()))
 
+# ── Source tracking ──────────────────────────────────────────────────────────
+# SQL-backed results always use this internal document_id; it is never a user
+# document UUID and must be excluded from document-filter subset checks.
+_SQL_INTERNAL_SOURCE_IDS: frozenset[str] = frozenset({"sql_query"})
+
+
+def _doc_ids_for_source_check(sources: list[dict]) -> set[str]:
+    """
+    Returns document IDs from sources that should be validated against
+    selected_ids (user-supplied document filter UUIDs).
+
+    SQL internal IDs ("sql_query") are excluded because they are never
+    members of a user's document_ids selection — they represent structured
+    data facts, not uploaded documents.  All real vector document UUIDs
+    pass through unchanged so real violations are still caught.
+    """
+    return {
+        s["document_id"]
+        for s in sources
+        if s.get("document_id")
+        and s["document_id"] != "unknown"
+        and s["document_id"] not in _SQL_INTERNAL_SOURCE_IDS
+    }
+
+
 # ── Intent Classification (lightweight, rule-based) ──
 
 ADVISORY_KEYWORDS = [
@@ -1279,10 +1304,12 @@ async def generate_chat_response(pool: asyncpg.Pool, pinecone_index: Any, embed_
     retrieved_ids = {s['document_id'] for s in sources if s.get('document_id') and s['document_id'] != 'unknown'}
     selected_ids = set(query.document_ids or [])
 
+    # Exclude SQL internal IDs from subset check — they are never user doc UUIDs.
+    retrieved_doc_ids = _doc_ids_for_source_check(sources)
     source_violation = False
-    if selected_ids and not retrieved_ids.issubset(selected_ids):
+    if selected_ids and not retrieved_doc_ids.issubset(selected_ids):
         source_violation = True
-        logger.error(f"STRICT SOURCE VIOLATION: Retrieved {retrieved_ids} is not subset of Selected {selected_ids}")
+        logger.error(f"STRICT SOURCE VIOLATION: Retrieved {retrieved_doc_ids} is not subset of Selected {selected_ids}")
 
     # Extract display names from actual citations for debugging visibility
     selected_source_names = [c.get("display_name") or c.get("id") for c in citations.values()]
@@ -1787,9 +1814,12 @@ async def _finalize_result_stage(
     retrieved_ids = {s["document_id"] for s in sources
                      if s.get("document_id") and s["document_id"] != "unknown"}
     selected_ids  = set(query.document_ids or [])
-    source_violation = bool(selected_ids and not retrieved_ids.issubset(selected_ids))
+
+    # Exclude SQL internal IDs from subset check — they are never user doc UUIDs.
+    retrieved_doc_ids = _doc_ids_for_source_check(sources)
+    source_violation = bool(selected_ids and not retrieved_doc_ids.issubset(selected_ids))
     if source_violation:
-        logger.error(f"STRICT SOURCE VIOLATION [STREAM]: Retrieved {retrieved_ids} is not subset of Selected {selected_ids}")
+        logger.error(f"STRICT SOURCE VIOLATION [STREAM]: Retrieved {retrieved_doc_ids} is not subset of Selected {selected_ids}")
 
     # Extract display names from actual citations for debugging visibility
     selected_source_names = [c.get("display_name") or c.get("id") for c in citations.values()]
@@ -2016,6 +2046,7 @@ async def run_debug_dry_run(
             intent_type=s.intent_type,
             sql_template_id=s.sql_template_id,
             execution_mode=s.execution_mode,
+            parameters=dict(s.parameters or {}),
         )
         for s in plan.steps
     ]

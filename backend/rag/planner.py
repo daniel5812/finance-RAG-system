@@ -22,6 +22,7 @@ from rag.router import (
     _apply_fx_direction,
 )
 from rag.schemas import HybridQueryPlan, PlanStep, VectorFilter, PlanMeta
+from rag.query_understanding import understand_query, QueryUnderstandingResult
 
 logger = get_logger(__name__)
 
@@ -219,6 +220,15 @@ def _resolve_sql(intent: dict, query: str, owner_id: Optional[str] = None) -> tu
     raw = intent["raw_params"]
 
     if itype == "fx_rate":
+        # Honor pre-resolved pair from QueryUnderstanding when both ISOs are valid.
+        pre_base = raw.get("base")
+        pre_quote = raw.get("quote")
+        if (
+            pre_base in _KNOWN_ISO
+            and pre_quote in _KNOWN_ISO
+            and pre_base != pre_quote
+        ):
+            return {"base": pre_base, "quote": pre_quote}, None
         params, error = _apply_fx_direction({}, query)
         if error:
             return {}, error
@@ -267,6 +277,137 @@ def _profile_hint(intent_type: str, user_profile: Optional[dict]) -> Optional[di
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
+_FACTUAL_SQL_INTENTS = {"fx_rate", "price_lookup", "etf_holdings", "macro_series"}
+
+
+def _derive_fx_pair(qu: QueryUnderstandingResult) -> tuple[Optional[str], Optional[str]]:
+    """
+    Derive (base, quote) from QU currency entities. Project conventions:
+      - {USD, ILS} or {ILS, USD} → USD/ILS
+      - {USD, X}                  → USD/X
+      - {ILS, X}, X != USD        → X/ILS  (don't return USD/ILS for EUR/ILS)
+      - single non-USD currency   → that/ILS
+      - single USD                → USD/ILS
+      - two non-USD/ILS           → first/second (preserve detection order)
+    Returns (None, None) if no currencies detected.
+    """
+    isos = [e.resolved_value for e in qu.entities if e.entity_type == "currency" and e.resolved_value]
+    # de-duplicate, preserve order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for iso in isos:
+        if iso not in seen:
+            seen.add(iso)
+            ordered.append(iso)
+
+    if not ordered:
+        return None, None
+
+    s = set(ordered)
+    if "USD" in s and "ILS" in s:
+        return "USD", "ILS"
+    if "USD" in s:
+        other = next(iso for iso in ordered if iso != "USD")
+        return "USD", other
+    if "ILS" in s and len(s) >= 2:
+        other = next(iso for iso in ordered if iso != "ILS")
+        return other, "ILS"
+    if len(ordered) == 1:
+        only = ordered[0]
+        if only == "USD":
+            return "USD", "ILS"
+        return only, "ILS"
+    return ordered[0], ordered[1]
+
+
+def _apply_query_understanding(
+    query: str,
+    raw_intents: list[dict],
+    qu: QueryUnderstandingResult,
+) -> list[dict]:
+    """
+    Augments raw_intents with QueryUnderstanding results when QU has higher
+    confidence. Existing planner behavior is the fallback.
+
+    Rules:
+    - QU high confidence (>= 0.65) + clear primary intent → prepend/override.
+    - QU provides resolved ticker/symbol/series/fx pair → inject into raw_params.
+    - QU low confidence or no primary_intent → return raw_intents unchanged.
+    - Advisory tone with entity → do NOT inject factual SQL intent.
+    """
+    if not qu.primary_intent or qu.confidence < 0.65:
+        return raw_intents
+
+    # If advisory_tone_with_entity flag is set, don't force SQL intents
+    if "advisory_tone_with_entity" in qu.ambiguity_flags:
+        return raw_intents
+
+    # If existing planner produced only no_match, treat as empty and let QU build.
+    only_no_match = (
+        len(raw_intents) == 1 and raw_intents[0].get("intent_type") == "no_match"
+    )
+
+    # Inject resolved tickers/symbols/fx pair into existing SQL intents that lack them
+    if raw_intents and not only_no_match:
+        for intent in raw_intents:
+            itype = intent["intent_type"]
+            if itype in ("price_lookup", "etf_holdings") and not intent["raw_params"].get(
+                "ticker" if itype == "price_lookup" else "symbol"
+            ):
+                resolved_ticker = qu.slots.get("ticker")
+                if resolved_ticker:
+                    param_key = "ticker" if itype == "price_lookup" else "symbol"
+                    intent["raw_params"][param_key] = resolved_ticker
+
+            if itype == "fx_rate" and not (
+                intent["raw_params"].get("base") and intent["raw_params"].get("quote")
+            ):
+                base, quote = _derive_fx_pair(qu)
+                if base and quote:
+                    intent["raw_params"]["base"] = base
+                    intent["raw_params"]["quote"] = quote
+        return raw_intents
+
+    # No intents detected by existing planner — try QU primary intent
+    qu_intent = qu.primary_intent
+
+    # Document-routed QU intent → vector/document path (not no_match)
+    if qu_intent == "document_lookup":
+        return [{"intent_type": "document_lookup", "raw_params": {}, "is_sql": False}]
+
+    if qu_intent not in _FACTUAL_SQL_INTENTS:
+        # Non-factual QU intent: let existing no_match / vector path handle
+        return raw_intents
+
+    # Build a new intent from QU result
+    slots = qu.slots
+    if qu_intent == "fx_rate":
+        base, quote = _derive_fx_pair(qu)
+        if base and quote:
+            return [{
+                "intent_type": "fx_rate",
+                "raw_params": {"base": base, "quote": quote},
+                "is_sql": True,
+            }]
+
+    if qu_intent == "price_lookup":
+        ticker = slots.get("ticker")
+        if ticker:
+            return [{"intent_type": "price_lookup", "raw_params": {"ticker": ticker}, "is_sql": True}]
+
+    if qu_intent == "etf_holdings":
+        ticker = slots.get("ticker")
+        if ticker:
+            return [{"intent_type": "etf_holdings", "raw_params": {"symbol": ticker}, "is_sql": True}]
+
+    if qu_intent == "macro_series":
+        series_id = slots.get("series_id")
+        if series_id:
+            return [{"intent_type": "macro_series", "raw_params": {"series_id": series_id}, "is_sql": True}]
+
+    return raw_intents
+
+
 def build_plan(
     query: str,
     owner_id: str,
@@ -282,7 +423,9 @@ def build_plan(
         user_profile:   Optional dict with risk_tolerance, experience_level.
         system_context: Optional dict with flags (has_portfolio, has_documents).
     """
+    qu = understand_query(query)
     raw_intents = _detect_intents(query, system_context or {})
+    raw_intents = _apply_query_understanding(query, raw_intents, qu)
 
     # Pre-compute whether plan will be hybrid (for execution_mode assignment)
     will_be_hybrid = any(i["is_sql"] for i in raw_intents) and any(

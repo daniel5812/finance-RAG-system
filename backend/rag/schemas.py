@@ -144,6 +144,7 @@ class PlanStepDebug(BaseModel):
     intent_type: str
     sql_template_id: Optional[str]
     execution_mode: str
+    parameters: Dict[str, Any] = {}
 
 class StepResultDebug(BaseModel):
     step_id: int

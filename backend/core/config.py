@@ -73,7 +73,10 @@ ROLE_ACCESS = {
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "200"))
 
 # ── Prompt Assembly ──
-PROMPT_ASSEMBLY_V2 = os.getenv("PROMPT_ASSEMBLY_V2", "false").lower() == "true"
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default).lower()).lower() == "true"
+
+PROMPT_ASSEMBLY_V2 = _parse_bool_env("PROMPT_ASSEMBLY_V2")
 
 # ── Document Pipeline ──
 # DOCUMENT_UPLOAD_DIR: where uploaded PDFs are saved on disk.
