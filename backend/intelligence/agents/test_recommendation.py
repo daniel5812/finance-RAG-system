@@ -142,3 +142,42 @@ class TestRecommendationAgentImmutability:
         # Verify the prompt explicitly forbids overriding the action
         assert "override" in _REASONING_PROMPT.lower(), \
             "Prompt should warn against overriding the action"
+
+
+# ── Phase 4E: Advisory Wording Guard ─────────────────────────────────────────
+
+class TestReasoningPromptWordingGuard:
+    """Verify _REASONING_PROMPT uses analytical framing, not personal-advice framing."""
+
+    def test_reasoning_prompt_forbids_direct_advice_phrasing(self):
+        """Prompt must explicitly forbid 'you should' and 'I recommend'."""
+        prompt_lower = _REASONING_PROMPT.lower()
+        assert "you should" in prompt_lower, (
+            "_REASONING_PROMPT must name 'you should' as forbidden phrasing"
+        )
+        assert "i recommend" in prompt_lower, (
+            "_REASONING_PROMPT must name 'I recommend' as forbidden phrasing"
+        )
+        assert "do not write" in prompt_lower, (
+            "_REASONING_PROMPT must contain a 'Do NOT write' guard sentence"
+        )
+
+    def test_reasoning_prompt_uses_analysis_framing(self):
+        """Prompt must instruct the LLM to frame output as scoring analysis."""
+        analytical_keywords = (
+            "score indicates",
+            "scoring model",
+            "signals suggest",
+            "data shows",
+            "classified",
+        )
+        prompt_lower = _REASONING_PROMPT.lower()
+        assert any(kw in prompt_lower for kw in analytical_keywords), (
+            f"_REASONING_PROMPT must contain at least one of: {analytical_keywords}"
+        )
+
+    def test_reasoning_prompt_override_guard_still_present(self):
+        """Existing override guard must not have been removed by Phase 4E changes."""
+        assert "override" in _REASONING_PROMPT.lower(), (
+            "_REASONING_PROMPT must still warn against overriding the deterministic action"
+        )

@@ -71,6 +71,7 @@ CHAT_BEHAVIOR_RULES = """\
 BEHAVIOR & REASONING RULES
 ═══════════════════════════════════════
 - **BINARY ADAPTATION**: If the user asks a Yes/No question (e.g., "Should I buy?"), provide a direct "YES", "NO", or "CAUTIOUS YES/NO" at the START of the Recommendation rationale.
+  Exception: for questions about a specific ticker or security (e.g., "Should I buy NVDA?", "Should I hold AAPL?", "Should I sell TSLA?"), do NOT answer with a bare YES/NO. Instead, explain what the scoring analysis indicates (action classification, confidence, key factors, tradeoffs) and note that individual circumstances vary.
 - **EMPTY PORTFOLIO BIAS**: If the user has no positions, acknowledge it ONCE in the Missing Data Audit. Do NOT repeatedly mention it as a problem in other sections; focus on general strategy instead.
 - **SIGNAL PRIORITIZATION**:
   - For long-term strategy: Macro > Gap > Asset.
@@ -289,6 +290,27 @@ CITATION: [D#] · [S#] · [I] — always bracketed. Space before bracket: "value
 Respond in the user's language (Hebrew question → Hebrew answer).
 """
 
+# ── Advisory Wording Guard (Phase 4E) ──
+# Injected into advisory prompts to prevent personal-advice framing.
+# BUY/HOLD/REDUCE/AVOID remain valid as system classification labels;
+# the guard constrains how they are narrated to the user.
+ADVISORY_WORDING_GUARD = """\
+
+WORDING CONSTRAINT (mandatory):
+- Do not say "I recommend [stock]", "You should buy [stock]", "You should hold [stock]",
+  or use command-style phrasing that presents system analysis as personal investment advice.
+- Do not write "Hold NVDA" / "Buy AAPL" as an instruction to the user.
+  It is allowed to say: "The scoring model classifies NVDA as HOLD" when that classification is present in context.
+- Frame as analysis: "The analysis indicates...", "Signals suggest...",
+  "The scoring model classifies X as [action] based on..."
+- Directional guidance is allowed at strategy/asset-class level only
+  (e.g., "increasing fixed income may reduce concentration risk").
+- Every advisory response should include at least one uncertainty or context qualifier
+  (e.g., "based on available data", "subject to market conditions",
+  "individual circumstances vary").
+- Mention confidence only if confidence is explicitly present in the provided context.\
+"""
+
 # ── Natural Advisory Response Prompt ──
 NATURAL_ADVISORY_PROMPT = """\
 You are a senior financial analyst giving practical, grounded investment insights.
@@ -367,6 +389,8 @@ Space before bracket: "value [D1]" — NEVER "valueD1". NEVER bare: D1, S1, I.
 End with:
 [[SuggestedQuestions: ["Q1", "Q2", "Q3"]]]
 """
+# Append wording guard so it is always present regardless of how callers use the constant.
+NATURAL_ADVISORY_PROMPT = NATURAL_ADVISORY_PROMPT + "\n" + ADVISORY_WORDING_GUARD
 
 # ── Intent Classification ──
 
