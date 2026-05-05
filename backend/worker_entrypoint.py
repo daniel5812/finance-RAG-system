@@ -158,6 +158,7 @@ async def _handle_financial_ingestion(pool, task):
                 pool,
                 PRICE_BACKFILL_SYMBOLS,
                 PRICE_BACKFILL_DEFAULT_DAYS,
+                trigger="scheduled",
             )
             logger.info(
                 f"Price refresh complete: {result['succeeded']} succeeded, "

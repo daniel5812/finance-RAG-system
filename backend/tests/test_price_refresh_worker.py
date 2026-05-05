@@ -39,7 +39,7 @@ def test_handle_price_refresh_calls_service(mock_refresh):
 
     _run(_handle_financial_ingestion(pool, {"type": "price_refresh"}))
 
-    mock_refresh.assert_called_once_with(pool, PRICE_BACKFILL_SYMBOLS, PRICE_BACKFILL_DEFAULT_DAYS)
+    mock_refresh.assert_called_once_with(pool, PRICE_BACKFILL_SYMBOLS, PRICE_BACKFILL_DEFAULT_DAYS, trigger="scheduled")
 
 
 @patch("worker_entrypoint.refresh_prices", new_callable=AsyncMock)
