@@ -102,3 +102,7 @@ PRICE_BACKFILL_SYMBOLS: list[str] = [
 # PRICE_BACKFILL_DEFAULT_DAYS: how many calendar days of history to request
 #   when no 'days' value is provided in the backfill request.
 PRICE_BACKFILL_DEFAULT_DAYS = int(os.getenv("PRICE_BACKFILL_DEFAULT_DAYS", "365"))
+
+# PRICE_STALENESS_DAYS: how many calendar days since last price row before a symbol is
+#   considered stale.  5 days covers normal weekends + a single US holiday.
+PRICE_STALENESS_DAYS = int(os.getenv("PRICE_STALENESS_DAYS", "5"))
