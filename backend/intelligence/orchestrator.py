@@ -60,6 +60,7 @@ from intelligence.agents.scoring_engine import ScoringEngineAgent
 from intelligence.agents.user_profiler import UserProfilerAgent
 from intelligence.agents.validation import ValidationAgent
 from intelligence.schemas import IntelligenceReport, MarketContext, UserInvestmentProfile
+from documents.service import aggregate_user_documents
 
 logger = get_logger(__name__)
 
@@ -153,6 +154,12 @@ class IntelligenceOrchestrator:
                     fetch_benchmark_holdings(pool, "QQQ")
                 )
 
+            # Document aggregation (non-fatal, available if pool + owner_id)
+            if pool and owner_id:
+                parallel_tasks["document_insights"] = asyncio.create_task(
+                    aggregate_user_documents(pool, owner_id)
+                )
+
             # Await all parallel tasks
             parallel_results = {}
             for name, task in parallel_tasks.items():
@@ -179,6 +186,19 @@ class IntelligenceOrchestrator:
                 # Surface the normalized portfolio at the top-level report
                 if portfolio_fit.normalized_portfolio:
                     report.normalized_portfolio = portfolio_fit.normalized_portfolio
+
+            # Document insights (non-fatal aggregation from extracted documents)
+            doc_insights = parallel_results.get("document_insights")
+            if doc_insights:
+                # Only set if aggregation produced meaningful data
+                has_data = (
+                    doc_insights.get("total_assets_from_docs", 0) > 0
+                    or doc_insights.get("accounts_detected", 0) > 0
+                    or doc_insights.get("latest_report_date") is not None
+                )
+                if has_data:
+                    report.document_insights = doc_insights
+                    report.agents_ran.append("DocumentInsightsAggregator")
 
             # ── Portfolio Gap Analysis (synthesis mode / no tickers) ─────
             # Runs when advisory/analytical intent but no specific tickers — provides

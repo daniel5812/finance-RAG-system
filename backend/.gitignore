@@ -10,4 +10,6 @@ echo ".claude/" >> .gitignore
 
 git add .gitignore
 git commit -m "chore: ignore pycache and claude local files"
-git push
+git push__pycache__/
+*.py[cod]
+*$py.class

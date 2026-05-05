@@ -72,6 +72,12 @@ ROLE_ACCESS = {
 # before throttling, which is sufficient for normal use.
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "200"))
 
+# ── Prompt Assembly ──
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default).lower()).lower() == "true"
+
+PROMPT_ASSEMBLY_V2 = _parse_bool_env("PROMPT_ASSEMBLY_V2")
+
 # ── Document Pipeline ──
 # DOCUMENT_UPLOAD_DIR: where uploaded PDFs are saved on disk.
 #   → In Docker: mount a volume here (e.g. ./data/uploads:/app/uploads)
