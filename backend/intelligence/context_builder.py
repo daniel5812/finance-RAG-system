@@ -211,13 +211,15 @@ def build_intelligence_context(report: IntelligenceReport) -> str:
     if report.recommendations:
         sections.append(_DIVIDER)
         sections.append(
-            "[INVESTMENT RECOMMENDATIONS — actions are deterministic; "
-            "DO NOT contradict these in your response]"
+            "[INVESTMENT RECOMMENDATIONS — model classification output; "
+            "DO NOT contradict these in your response; "
+            "present as classification language, not as user commands]"
         )
         for r in report.recommendations:
             action_str = r.action.value.upper()
             conf_str   = f"[{r.confidence} confidence]"
-            sections.append(f"\n  ► {r.ticker}: {action_str} {conf_str}")
+            sections.append(f"\n  ► {r.ticker} — MODEL CLASSIFICATION: {action_str} {conf_str}")
+            sections.append(f"    Classification meaning: {_action_meaning(r.action)}")
             if r.reasoning:
                 sections.append(f"    Reasoning:   {r.reasoning}")
             if r.trade_offs:
@@ -484,3 +486,20 @@ def _render_validation(vr: ValidationResult) -> str:
         if vr.confidence_override else ""
     )
     return f"[VALIDATION] ⚠ Found potential logical inconsistencies:\n{flag_lines}\n{override_note}"
+
+
+# ─────────────────────────────────────────────────────────────
+# Recommendation classification meanings
+# ─────────────────────────────────────────────────────────────
+
+_ACTION_MEANINGS: dict[RecommendationAction, str] = {
+    RecommendationAction.BUY:               "scoring signals favor initiating or adding exposure",
+    RecommendationAction.HOLD:              "scoring signals indicate monitoring; not a directive to add aggressively",
+    RecommendationAction.REDUCE:            "scoring signals indicate reducing exposure; risk/reward is unfavorable",
+    RecommendationAction.AVOID:             "scoring signals are insufficient to support a positive position",
+    RecommendationAction.INSUFFICIENT_DATA: "insufficient data to generate a classification",
+}
+
+
+def _action_meaning(action: RecommendationAction) -> str:
+    return _ACTION_MEANINGS.get(action, "see scoring context above")

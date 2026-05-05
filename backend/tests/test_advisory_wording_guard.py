@@ -66,3 +66,27 @@ def test_legacy_chat_behavior_rules_carves_out_stock_picks():
     assert "specific ticker" in CHAT_BEHAVIOR_RULES or "specific stock" in CHAT_BEHAVIOR_RULES, (
         "CHAT_BEHAVIOR_RULES must carve out 'specific ticker' or 'specific stock' from bare YES/NO"
     )
+
+
+# ── Phase 4.3: Recommendation Classification Rendering ───────────────────────
+
+def test_advisory_wording_guard_forbids_action_ticker_opener():
+    """Guard must explicitly prohibit opening a response with [Action] [Ticker] constructions."""
+    assert any(phrase in ADVISORY_WORDING_GUARD for phrase in (
+        "Never open",
+        "[Action] [Ticker]",
+        "Hold NVDA",
+        "Buy AAPL",
+    )), (
+        "ADVISORY_WORDING_GUARD must prohibit '[Action] [Ticker]' response opener patterns "
+        "such as 'Hold NVDA' or 'Buy AAPL' — add the new opener prohibition sentence"
+    )
+
+
+def test_chat_system_prompt_contains_wording_guard():
+    """ADVISORY_WORDING_GUARD must be included in the main CHAT_SYSTEM_PROMPT assembly."""
+    from core.prompts import CHAT_SYSTEM_PROMPT
+    assert "WORDING CONSTRAINT" in CHAT_SYSTEM_PROMPT, (
+        "CHAT_SYSTEM_PROMPT must include the ADVISORY_WORDING_GUARD block — "
+        "add ADVISORY_WORDING_GUARD to the CHAT_SYSTEM_PROMPT assembly in prompts.py"
+    )
