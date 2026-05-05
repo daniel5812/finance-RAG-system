@@ -22,6 +22,8 @@ from documents.worker import process_document_worker
 from financial.providers.fx import BOIProvider
 from financial.providers.holdings import HoldingsProvider
 from financial.services.proactive_insights_service import ProactiveInsightEngine
+from financial.services.price_refresh_service import refresh_prices
+from core.config import PRICE_BACKFILL_SYMBOLS, PRICE_BACKFILL_DEFAULT_DAYS
 
 logger = get_logger("worker")
 
@@ -32,6 +34,27 @@ shutdown_event = asyncio.Event()
 def handle_signal():
     logger.info("Shutdown signal received...")
     shutdown_event.set()
+
+# ── Scheduler Helpers ────────────────────────────────────────────────────────
+
+async def _enqueue_scheduled_financial_tasks(redis_client):
+    await redis_client.rpush(
+        "tasks:financial_ingestion",
+        json.dumps({"type": "fx_ingestion", "incremental": True}),
+    )
+    await redis_client.rpush(
+        "tasks:financial_ingestion",
+        json.dumps({"type": "holdings_ingestion"}),
+    )
+    await redis_client.rpush(
+        "tasks:financial_ingestion",
+        json.dumps({"type": "proactive_insights"}),
+    )
+    await redis_client.rpush(
+        "tasks:financial_ingestion",
+        json.dumps({"type": "price_refresh"}),
+    )
+
 
 # ── Scheduler Loop ───────────────────────────────────────────────────────────
 
@@ -60,22 +83,7 @@ async def scheduler_loop():
             except asyncio.TimeoutError:
                 # Time to trigger tasks
                 logger.info("Triggering scheduled financial ingestion tasks...")
-                
-                # Push FX task
-                await redis_client.rpush("tasks:financial_ingestion", json.dumps({
-                    "type": "fx_ingestion",
-                    "incremental": True
-                }))
-                
-                # Push Holdings task
-                await redis_client.rpush("tasks:financial_ingestion", json.dumps({
-                    "type": "holdings_ingestion"
-                }))
-                
-                # Push Proactive Insights task
-                await redis_client.rpush("tasks:financial_ingestion", json.dumps({
-                    "type": "proactive_insights"
-                }))
+                await _enqueue_scheduled_financial_tasks(redis_client)
                 
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
@@ -144,7 +152,18 @@ async def _handle_financial_ingestion(pool, task):
             
         elif task_type == "proactive_insights":
             await ProactiveInsightEngine.run_periodic_check(pool)
-            
+
+        elif task_type == "price_refresh":
+            result = await refresh_prices(
+                pool,
+                PRICE_BACKFILL_SYMBOLS,
+                PRICE_BACKFILL_DEFAULT_DAYS,
+            )
+            logger.info(
+                f"Price refresh complete: {result['succeeded']} succeeded, "
+                f"{result['failed']} failed out of {result['total_symbols']} symbols."
+            )
+
         logger.info(f"Financial ingestion complete: {task_type}")
     except Exception as e:
         logger.error(f"Financial ingestion failed ({task_type}): {e}")
