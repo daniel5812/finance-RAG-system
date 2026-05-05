@@ -348,6 +348,69 @@ async def get_user_profile(pool: asyncpg.Pool, user_id: str) -> dict | None:
     )
     return dict(row) if row else None
 
+
+# ── INGESTION RUNS ───────────────────────────────────────────────────────────
+
+async def insert_ingestion_run(
+    pool: asyncpg.Pool,
+    run_type: str,
+    trigger_type: str,
+    provider: str,
+    symbols_count: int,
+    succeeded: int,
+    failed: int,
+    rows_ingested: int,
+    status: str,
+    error_summary: str | None,
+    started_at: datetime,
+    finished_at: datetime,
+    duration_ms: int,
+) -> None:
+    await pool.execute(
+        """
+        INSERT INTO ingestion_runs
+            (run_type, trigger_type, provider, symbols_count, succeeded, failed,
+             rows_ingested, status, error_summary, started_at, finished_at, duration_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        """,
+        run_type, trigger_type, provider, symbols_count, succeeded, failed,
+        rows_ingested, status, error_summary, started_at, finished_at, duration_ms,
+    )
+
+
+async def get_recent_ingestion_runs(
+    pool: asyncpg.Pool,
+    limit: int = 20,
+    run_type: str | None = None,
+) -> list[dict]:
+    if run_type is not None:
+        rows = await pool.fetch(
+            """
+            SELECT id, run_type, trigger_type, provider, symbols_count, succeeded, failed,
+                   rows_ingested, status, error_summary, started_at, finished_at,
+                   duration_ms, created_at
+            FROM ingestion_runs
+            WHERE run_type = $1
+            ORDER BY started_at DESC
+            LIMIT $2
+            """,
+            run_type, limit,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT id, run_type, trigger_type, provider, symbols_count, succeeded, failed,
+                   rows_ingested, status, error_summary, started_at, finished_at,
+                   duration_ms, created_at
+            FROM ingestion_runs
+            ORDER BY started_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    return [dict(r) for r in rows]
+
+
 async def upsert_user_profile(pool: asyncpg.Pool, user_id: str, data: dict):
     await pool.execute(
         """

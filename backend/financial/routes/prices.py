@@ -16,6 +16,7 @@ from core.dependencies import get_db_pool, require_scope
 from core.logger import get_logger
 from financial.providers.price import StooqProvider
 from financial.schemas import PriceIngestRequest, PriceBackfillRequest
+from financial.crud import get_recent_ingestion_runs
 from financial.services.price_refresh_service import get_price_freshness, refresh_prices
 from core.config import PRICE_BACKFILL_SYMBOLS, PRICE_BACKFILL_DEFAULT_DAYS, PRICE_STALENESS_DAYS
 
@@ -83,7 +84,22 @@ async def backfill_prices(
     """
     symbols = [s.strip().upper() for s in request.symbols] if request.symbols is not None else PRICE_BACKFILL_SYMBOLS
     days = request.days if request.days is not None else PRICE_BACKFILL_DEFAULT_DAYS
-    return await refresh_prices(pool, symbols, days)
+    return await refresh_prices(pool, symbols, days, trigger="manual")
+
+
+@router.get("/ingest/runs")
+async def list_ingestion_runs(
+    run_type: str | None = None,
+    limit: int = 20,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _: bool = Depends(require_scope("admin")),
+):
+    """
+    Return recent ingestion run summaries. Admin only.
+    """
+    safe_limit = min(max(limit, 1), 100)
+    runs = await get_recent_ingestion_runs(pool, limit=safe_limit, run_type=run_type)
+    return {"runs": runs, "count": len(runs)}
 
 
 @router.get("/prices/freshness")

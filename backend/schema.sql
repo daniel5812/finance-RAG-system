@@ -331,3 +331,28 @@ CREATE TABLE IF NOT EXISTS observability_llm_traces (
 CREATE INDEX IF NOT EXISTS idx_obs_llm_ts ON observability_llm_traces (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_obs_llm_behavior ON observability_llm_traces
     ((behavior->>'classification'), timestamp DESC);
+
+
+-- ============================================================
+-- 15. Ingestion Run Tracking
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    id              BIGSERIAL    PRIMARY KEY,
+    run_type        VARCHAR(50)  NOT NULL,       -- price_refresh | price_backfill
+    trigger_type    VARCHAR(20)  NOT NULL,       -- manual | scheduled
+    provider        VARCHAR(50)  NOT NULL,       -- yfinance
+    symbols_count   INTEGER      NOT NULL,
+    succeeded       INTEGER      NOT NULL,
+    failed          INTEGER      NOT NULL,
+    rows_ingested   INTEGER      NOT NULL,
+    status          VARCHAR(20)  NOT NULL,       -- success | partial | failed
+    error_summary   TEXT,
+    started_at      TIMESTAMPTZ  NOT NULL,
+    finished_at     TIMESTAMPTZ  NOT NULL,
+    duration_ms     INTEGER      NOT NULL,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ingestion_runs_ts
+    ON ingestion_runs (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ingestion_runs_type
+    ON ingestion_runs (run_type, started_at DESC);
