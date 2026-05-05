@@ -62,6 +62,30 @@ async def get_last_price_date(pool: asyncpg.Pool, symbol: str, source: str) -> d
     return row["last_date"] if row and row["last_date"] else None
 
 
+async def get_latest_price_dates_bulk(
+    pool: asyncpg.Pool,
+    symbols: list[str],
+) -> dict[str, date | None]:
+    """Return {symbol: latest_date_or_None} for all requested symbols in one query."""
+    if not symbols:
+        return {}
+
+    normalized = [s.strip().upper() for s in symbols if s and s.strip()]
+    if not normalized:
+        return {}
+
+    rows = await pool.fetch(
+        "SELECT symbol, MAX(date)::date AS latest_date "
+        "FROM prices WHERE symbol = ANY($1) GROUP BY symbol",
+        normalized,
+    )
+
+    result: dict[str, date | None] = {s: None for s in normalized}
+    for row in rows:
+        result[row["symbol"]] = row["latest_date"]
+    return result
+
+
 # ── MACRO ───────────────────────────────────────────────────────────────────
 
 async def upsert_macro_series(pool: asyncpg.Pool, rows: list[dict]) -> int:

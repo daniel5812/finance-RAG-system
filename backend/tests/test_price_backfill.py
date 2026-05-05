@@ -110,7 +110,7 @@ def _mock_pool():
 
 # For route tests we patch at the provider level so no real network call occurs.
 
-@patch("financial.routes.prices.YFinancePriceProvider")
+@patch("financial.services.price_refresh_service.YFinancePriceProvider")
 def test_backfill_uses_configured_symbols_when_request_empty(MockProvider, admin_client):
     from core.config import PRICE_BACKFILL_SYMBOLS
 
@@ -127,7 +127,7 @@ def test_backfill_uses_configured_symbols_when_request_empty(MockProvider, admin
     assert data["total_symbols"] == len(PRICE_BACKFILL_SYMBOLS)
 
 
-@patch("financial.routes.prices.YFinancePriceProvider")
+@patch("financial.services.price_refresh_service.YFinancePriceProvider")
 def test_backfill_explicit_symbols_override_defaults(MockProvider, admin_client):
     instance = MockProvider.return_value
     instance.ingest_incremental = AsyncMock(return_value=_make_success_outcome("AAPL"))
@@ -143,7 +143,7 @@ def test_backfill_explicit_symbols_override_defaults(MockProvider, admin_client)
     assert data["total_symbols"] == 2
 
 
-@patch("financial.routes.prices.YFinancePriceProvider")
+@patch("financial.services.price_refresh_service.YFinancePriceProvider")
 def test_backfill_calls_ingest_incremental_per_symbol(MockProvider, admin_client):
     instance = MockProvider.return_value
     instance.ingest_incremental = AsyncMock(return_value=_make_success_outcome("X"))
@@ -156,7 +156,7 @@ def test_backfill_calls_ingest_incremental_per_symbol(MockProvider, admin_client
     assert instance.ingest_incremental.call_count == 3
 
 
-@patch("financial.routes.prices.YFinancePriceProvider")
+@patch("financial.services.price_refresh_service.YFinancePriceProvider")
 def test_backfill_per_symbol_failure_does_not_stop_others(MockProvider, admin_client):
     instance = MockProvider.return_value
 
@@ -184,7 +184,7 @@ def test_backfill_per_symbol_failure_does_not_stop_others(MockProvider, admin_cl
     assert statuses["TSLA"] == "success"
 
 
-@patch("financial.routes.prices.YFinancePriceProvider")
+@patch("financial.services.price_refresh_service.YFinancePriceProvider")
 def test_backfill_response_shape(MockProvider, admin_client):
     instance = MockProvider.return_value
     instance.ingest_incremental = AsyncMock(return_value=_make_success_outcome("SPY", rows=100))
