@@ -10,7 +10,7 @@ from datetime import date, timedelta
 import httpx
 from fastapi import APIRouter, HTTPException, Depends
 import asyncpg
-from core.dependencies import get_db_pool
+from core.dependencies import get_db_pool, require_scope
 
 from core.logger import get_logger
 from financial.providers.price import StooqProvider, YFinancePriceProvider
@@ -24,7 +24,8 @@ router = APIRouter(prefix="/financial", tags=["financial - prices"])
 @router.post("/ingest/prices")
 async def ingest_prices(
     request: PriceIngestRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool)
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _: bool = Depends(require_scope("admin")),
 ):
     """
     Ingest daily price data for a symbol from Stooq.
@@ -69,6 +70,7 @@ async def ingest_prices(
 async def backfill_prices(
     request: PriceBackfillRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
+    _: bool = Depends(require_scope("admin")),
 ):
     """
     Backfill historical daily prices for a list of symbols via Yahoo Finance.
