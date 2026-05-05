@@ -18,25 +18,28 @@
 9. conversation context injection:
    - If session history exists → include summarized context
    - If no history → proceed stateless
-10. security.py PII filter → OpenAI (synthesis only, no SQL injection) → confidence → cache + return
+10. PromptAssembly V2: assemble context + citations ([S#]/[D#]) + mode_hint
+11. security.py PII filter → OpenAI (synthesis only, no SQL injection) → confidence → cache + return
 
 ## Factual Mode (Pure SQL Queries)
 
 **Triggers**
-- Single intent with valid SQL params: etf_holdings, portfolio_lookup, price_lookup, fx_rate
+- Single intent with valid SQL params: etf_holdings, portfolio_lookup, price_lookup, fx_rate, data_availability_lookup
 - No accompanying vector intent; no advisory context requested
 
 **Path**
 1. Planner: SQL-only source selected; no knowledge_query step added
 2. Executor: SQL query runs; empty result returns status=empty (not error)
 3. Fusion: structured_data populated; no profile injection; no intelligence layer invoked
-4. Response: direct answer style (facts only, no reasoning synthesis)
+4. PromptAssembly: mode_hint=factual; [S#] citations only; no document context
+5. Response: direct answer style (facts only, no reasoning synthesis)
 
 **Constraints**
 - Intelligence layer (all 7 agents) is skipped
 - User profile NOT injected into context
-- No LLM synthesis; only data assembly
-- Empty SQL result (0 rows) is valid end state; no fallback to vector
+- No vector fallback; no document context injection
+- Empty SQL result (0 rows) is valid end state; system returns "no data available" deterministically
+- No LLM estimation or elaboration beyond retrieved SQL facts
 
 ## Retrieval Layer — Planner → Executor → Fusion
 
@@ -64,17 +67,20 @@
 | price_lookup | sql | ticker (1-5 chars) |
 | macro_series | sql | series_id (FRED ID) |
 | etf_holdings | sql | symbol (1-5 chars) |
+| data_availability_lookup | sql | none |
 | document_lookup / filing_lookup | vector | ticker? |
 | knowledge_query | vector | — |
+| advisory | vector | — |
 | no_match | vector (owner_id only) | — |
 | hybrid | sql + vector | per-step params |
 
 **SQL Templates**
 ```
-fx_rate:      SELECT rate, date FROM fx_rates WHERE base_currency='{base}' AND quote_currency='{quote}' ORDER BY date DESC LIMIT 1
-price_lookup: SELECT symbol, close, date FROM prices WHERE symbol='{ticker}' ORDER BY date DESC LIMIT 30
-macro_series: SELECT series_id, value, date FROM macro_series WHERE series_id='{series_id}' ORDER BY date DESC LIMIT 12
-etf_holdings: SELECT holding_symbol, weight FROM etf_holdings WHERE etf_symbol='{symbol}' ORDER BY weight DESC LIMIT 20
+fx_rate:              SELECT rate, date FROM fx_rates WHERE base_currency='{base}' AND quote_currency='{quote}' ORDER BY date DESC LIMIT 1
+price_lookup:         SELECT symbol, close, date FROM prices WHERE symbol='{ticker}' ORDER BY date DESC LIMIT 30
+macro_series:         SELECT series_id, value, date FROM macro_series WHERE series_id='{series_id}' ORDER BY date DESC LIMIT 12
+etf_holdings:         SELECT holding_symbol, weight FROM etf_holdings WHERE etf_symbol='{symbol}' ORDER BY weight DESC LIMIT 20
+data_availability:    SELECT DISTINCT symbol FROM prices ORDER BY symbol (conceptually; returns available price symbols)
 ```
 
 **Source Selection Rules**
@@ -119,6 +125,14 @@ QueryPlan
     is_hybrid        bool
     fusion_required  bool
 ```
+
+**QueryUnderstanding (IMPLEMENTED)**
+- Deterministic intent parsing for Hebrew/English free-form queries
+- Alias resolution: Apple/AAPL, Tesla/TSLA, NVDA; S&P/SPY, Nasdaq/QQQ
+- Hebrew ETF composition detection: "מה יש בתוך SPY?" / "מהם המרכיבים של קרן SPY?" → etf_holdings intent
+- Data availability phrases: "של איזה מניות כן יש לך?" / "which stock prices are available?" → data_availability_lookup intent
+- Advisory entity detection: "what do you think about NVDA?" → advisory intent (not forced into price_lookup)
+- No LLM involved; purely keyword + pattern matching
 
 **Planner Does NOT Do**
 - Execute queries
@@ -389,4 +403,32 @@ Context Builder
 - NO source selection override (router determines SQL/vector/hybrid; LLM cannot change it)
 - NO P&L estimation (cost_basis insufficient; LLM forbidden from extrapolating returns)
 - Conversation summary is advisory context only (similar to user profile)
-- LLM must not treat history as authoritative data over retrieved SQL/vector results                                                                                                                                                                                                                                                                                                                                                                                                                     
+- LLM must not treat history as authoritative data over retrieved SQL/vector results
+
+## Advisory Wording Guard
+
+**Purpose**: Discourage personal investment command wording while allowing analytical discussion
+
+**Allowed Behavior**:
+- Analytical direction: "The scoring model classifies NVDA as HOLD based on..."
+- Classification explanation: explaining why deterministic scores/models produce their output
+- Uncertainty qualifiers: "Based on available data..." / "Current signals suggest..."
+- Discussion of internal classifications as outputs, not as personal directives
+
+**Discouraged Behavior**:
+- Personal recommendation: "I recommend buying NVDA"
+- Imperative directive: "You should hold this position"
+- Prescriptive action command: "Reduce your TSLA holdings" (as instruction, not analysis)
+- Reframing internal BUY/HOLD/REDUCE/AVOID as personal advice
+
+**Implementation**:
+- ADVISORY_WORDING_GUARD in PromptAssembler NATURAL_ADVISORY_PROMPT
+- CHAT_BEHAVIOR_RULES carves out ticker/security stock-pick questions
+- RecommendationAgent reasoning focuses on "scoring-signal analysis" not "why this action is right"
+- Soft prompt guard at synthesis time; no hard post-generation filter
+- BUY/HOLD/REDUCE/AVOID remain internal classifications (Stage 2/3 outputs)
+
+**Note**:
+- Soft guard relies on LLM instruction clarity; LLM can exceed instructions if sufficiently prompted otherwise
+- Not a tokenizer constraint; manual review still needed for edge cases
+- Advisory mode allows reasoning; this guard prevents the reasoning from becoming prescriptive                                                                                                                                                                                                                                                                                                                                                                                                                     
