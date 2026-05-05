@@ -115,13 +115,38 @@ MATRIX: list[ExpectRow] = [
         ),
     ),
     ExpectRow(
-        query="של איזה מניות כן יש לך?",
-        expected_intents=[],  # currently unsupported
-        diagnostic_category="missing_intent:data_availability_lookup",
+        query="מה כוללים הנכסים או המניות בתוך SPY?",
+        expected_intents=["etf_holdings"],
+        expected_template_id="etf_holdings_top20",
+        expected_params_subset={"symbol": "SPY"},
+        expected_mode_hint="factual",
+        diagnostic_category="routing_or_cache_or_holdings_coverage",
+        notes="Phase 4C.1 — condensed Hebrew ETF phrase with כוללים.",
+    ),
+    ExpectRow(
+        query="מהם המרכיבים של קרן SPY?",
+        expected_intents=["etf_holdings"],
+        expected_template_id="etf_holdings_top20",
+        expected_params_subset={"symbol": "SPY"},
+        expected_mode_hint="factual",
+        diagnostic_category="routing_or_cache_or_holdings_coverage",
         notes=(
-            "Phase 4C — needs a new data_availability_lookup intent backed by "
-            "SELECT symbol, COUNT(*), MAX(date) FROM prices GROUP BY symbol. "
-            "Today's planner has no such route; expect no_match / weak match."
+            "Phase 4C.1 — condensed Hebrew ETF phrase. "
+            "'מרכיבים' (components) + explicit ticker SPY must route to SQL etf_holdings. "
+            "Live answer depends on etf_holdings table coverage for SPY."
+        ),
+    ),
+    ExpectRow(
+        query="של איזה מניות כן יש לך?",
+        expected_intents=["data_availability_lookup"],
+        expected_template_id="data_availability_prices_summary",
+        expected_params_subset={},
+        expected_mode_hint="factual",
+        diagnostic_category="working_if_prices_table_has_rows",
+        notes=(
+            "Phase 4C — deterministic data_availability_lookup against `prices` "
+            "(SELECT symbol, COUNT(*), MAX(date) GROUP BY symbol). Live answer "
+            "depends on rows actually present in the prices table."
         ),
     ),
 ]

@@ -75,6 +75,22 @@ async def _run_step(
                 data = await sql_runner(step.sql_template_id, step.parameters)
             else:
                 data = []
+
+            # Phase 4C: deterministic no-data note for empty price_lookup so the
+            # downstream context says "I do not have price data for X" instead
+            # of a vague empty cell. Keeps factual mode; no vector fallback.
+            if not data and step.intent_type == "price_lookup":
+                ticker = (step.parameters or {}).get("ticker", "")
+                note = (
+                    f"I do not currently have price data for {ticker} in the "
+                    f"local database."
+                )
+                data = [{
+                    "no_data": note,
+                    "ticker": ticker,
+                    "rows_found": 0,
+                }]
+
             return _make_result(step, data)
 
         else:  # VECTOR or NO_MATCH

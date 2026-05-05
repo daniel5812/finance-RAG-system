@@ -268,3 +268,87 @@ def test_qu_existing_usd_to_eur_preserved():
     assert s.intent_type == "fx_rate"
     assert s.parameters["base"] == "USD"
     assert s.parameters["quote"] == "EUR"
+
+
+# ── Phase 4C: data_availability_lookup ───────────────────────────────────────
+
+def test_data_availability_hebrew_builds_sql_factual():
+    plan = build_plan("של איזה מניות כן יש לך?", OWNER)
+    assert len(plan.steps) == 1
+    s = plan.steps[0]
+    assert s.source_type == "SQL"
+    assert s.intent_type == "data_availability_lookup"
+    assert s.sql_template_id == "data_availability_prices_summary"
+    assert s.parameters == {}
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_data_availability_english_builds_sql_factual():
+    plan = build_plan("which stock prices are available?", OWNER)
+    intents = [s.intent_type for s in plan.steps]
+    assert "data_availability_lookup" in intents
+    assert all(s.source_type == "SQL" for s in plan.steps)
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_data_availability_does_not_require_ticker_param():
+    plan = build_plan("איזה מחירי מניות יש לך?", OWNER)
+    s = plan.steps[0]
+    assert s.intent_type == "data_availability_lookup"
+    assert "ticker" not in (s.parameters or {})
+    assert "symbol" not in (s.parameters or {})
+
+
+def test_data_availability_suppresses_price_lookup():
+    # Phrases overlap with price_lookup keywords ("מחיר", "מניה");
+    # planner must not also emit price_lookup.
+    plan = build_plan("איזה מחירי מניות יש לך?", OWNER)
+    intents = [s.intent_type for s in plan.steps]
+    assert "price_lookup" not in intents
+    assert "etf_holdings" not in intents
+
+
+# ── Phase 4C.1: Hebrew ETF composition / condensed query phrases ──────────────
+
+def test_etf_holdings_hebrew_condensed_phrase():
+    """מהם המרכיבים של קרן SPY? → SQL etf_holdings SPY, factual."""
+    plan = build_plan("מהם המרכיבים של קרן SPY?", OWNER)
+    intents = [s.intent_type for s in plan.steps]
+    assert "etf_holdings" in intents
+    for s in plan.steps:
+        if s.intent_type == "etf_holdings":
+            assert s.source_type == "SQL"
+            assert s.sql_template_id == "etf_holdings_top20"
+            assert s.parameters.get("symbol") == "SPY"
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_etf_holdings_hebrew_mirkivei():
+    """מרכיבי QQQ → SQL etf_holdings QQQ."""
+    plan = build_plan("מרכיבי QQQ", OWNER)
+    intents = [s.intent_type for s in plan.steps]
+    assert "etf_holdings" in intents
+    for s in plan.steps:
+        if s.intent_type == "etf_holdings":
+            assert s.parameters.get("symbol") == "QQQ"
+
+
+def test_etf_holdings_hebrew_kollelim():
+    """מה כוללים הנכסים או המניות בתוך SPY? → SQL etf_holdings SPY."""
+    plan = build_plan("מה כוללים הנכסים או המניות בתוך SPY?", OWNER)
+    intents = [s.intent_type for s in plan.steps]
+    assert "etf_holdings" in intents
+    for s in plan.steps:
+        if s.intent_type == "etf_holdings":
+            assert s.parameters.get("symbol") == "SPY"
+    assert plan.plan_meta.mode_hint == "factual"
+
+
+def test_etf_holdings_hebrew_eilu_bakeren():
+    """אילו מניות יש בקרן SPY? → SQL etf_holdings SPY."""
+    plan = build_plan("אילו מניות יש בקרן SPY?", OWNER)
+    intents = [s.intent_type for s in plan.steps]
+    assert "etf_holdings" in intents
+    for s in plan.steps:
+        if s.intent_type == "etf_holdings":
+            assert s.parameters.get("symbol") == "SPY"

@@ -191,6 +191,14 @@ _INTENT_SIGNALS: dict[str, list[str]] = {
         "companies inside", "companies are inside", "which companies are inside",
         "מה יש בתוך", "מה ההרכב", "איזה מניות", "החזקות", "ממה מורכב", "מה בפנים",
         "הרכב",
+        # Phase 4C.1: condensed/rewritten Hebrew ETF composition phrases.
+        # "מרכיבים" = components/constituents, "קרן" = fund.
+        # Kept as compound phrases (not bare "מרכיבים") to avoid false positives
+        # on non-financial "components" questions.
+        "מהם המרכיבים", "מרכיבי קרן", "הרכב קרן", "מרכיבים של",
+        "ממה מורכבת", "מרכיבי ה", "הרכב הקרן",
+        "מה כוללים הנכסים", "מה כוללות המניות",
+        "אילו מניות יש בקרן", "אילו נכסים יש בקרן",
     ],
     "portfolio": [
         "portfolio risk", "analyze my portfolio", "should i diversify",
@@ -218,6 +226,36 @@ _INTENT_SIGNALS: dict[str, list[str]] = {
         "outlook", "trend",
         "מה קורה בשוק", "מה אתה חושב על השוק", "מה המגמה",
         "תסביר לי מה קורה",
+    ],
+    # Phase 4C: deterministic data availability / coverage questions.
+    # Long, specific phrases — must combine an availability cue with a
+    # data-class word so we don't collide with price_lookup.
+    "data_availability_lookup": [
+        # Hebrew
+        "של איזה מניות כן יש לך",
+        "איזה מניות יש לך",
+        "אילו מניות יש לך",
+        "איזה מחירי מניות יש לך",
+        "אילו מחירי מניות יש לך",
+        "איזה סימבולים יש לך",
+        "אילו סימבולים יש לך",
+        "איזה סימבולים זמינים",
+        "אילו סימבולים זמינים",
+        "מחירי מניות זמינים",
+        "מניות זמינות",
+        # English
+        "which stock prices are available",
+        "what stock prices are available",
+        "what symbols do you have prices for",
+        "which symbols do you have prices for",
+        "what market prices do you have",
+        "which market prices do you have",
+        "what tickers do you have",
+        "which tickers do you have",
+        "available stock prices",
+        "available symbols",
+        "list of available symbols",
+        "list of available stocks",
     ],
 }
 
@@ -444,6 +482,11 @@ def _score_intents(
             if has_doc:
                 conf = min(conf + 0.05, 0.9)
 
+        # Data availability phrases are long and specific; promote so they
+        # dominate price_lookup on overlapping tokens like "מחיר"/"מניה".
+        if intent_type == "data_availability_lookup":
+            conf = min(conf + 0.3, 0.95)
+
         candidates.append(IntentCandidate(
             intent_type=intent_type,
             confidence=round(conf, 3),
@@ -469,6 +512,18 @@ def _score_intents(
             matched_signals=[],
             source="entity",
         ))
+
+    # If data_availability_lookup was matched with high confidence, demote
+    # price_lookup / etf_holdings — the user is asking what we *have*, not
+    # the value of a specific instrument.
+    avail = next(
+        (c for c in candidates if c.intent_type == "data_availability_lookup"),
+        None,
+    )
+    if avail and avail.confidence >= 0.8:
+        for c in candidates:
+            if c.intent_type in ("price_lookup", "etf_holdings"):
+                c.confidence = round(max(c.confidence - 0.4, 0.1), 3)
 
     # Sort by confidence descending
     candidates.sort(key=lambda c: c.confidence, reverse=True)

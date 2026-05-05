@@ -355,6 +355,35 @@ def test_advisory_what_do_you_think_nvda_not_factual():
     assert r.primary_intent != "etf_holdings"
 
 
+# ── Phase 4C: data_availability_lookup ───────────────────────────────────────
+
+def test_data_availability_hebrew_which_stocks():
+    r = understand_query("של איזה מניות כן יש לך?")
+    assert r.primary_intent == "data_availability_lookup"
+
+
+def test_data_availability_hebrew_which_prices():
+    r = understand_query("איזה מחירי מניות יש לך?")
+    assert r.primary_intent == "data_availability_lookup"
+
+
+def test_data_availability_english_which_prices_available():
+    r = understand_query("which stock prices are available?")
+    assert r.primary_intent == "data_availability_lookup"
+
+
+def test_data_availability_english_what_symbols():
+    r = understand_query("what symbols do you have prices for?")
+    assert r.primary_intent == "data_availability_lookup"
+
+
+def test_price_lookup_still_wins_for_specific_ticker():
+    # Sanity: a clear price question for a specific company is still
+    # price_lookup, not the new data_availability intent.
+    r = understand_query("מה שווי המניה של אפל?")
+    assert r.primary_intent == "price_lookup"
+
+
 def test_ambiguous_price_of_that():
     """'price of that' — phrase signal but no ticker → low confidence, no SQL slot."""
     r = understand_query("price of that")
@@ -362,3 +391,46 @@ def test_ambiguous_price_of_that():
         assert "missing_slot:ticker" in r.ambiguity_flags
         assert r.confidence < 0.75
     assert "ticker" not in r.slots
+
+
+# ── Phase 4C.1: Hebrew ETF composition / condensed query phrases ──────────────
+
+def test_etf_holdings_hebrew_spy_condensed_phrase():
+    """מהם המרכיבים של קרן SPY? → etf_holdings, ticker=SPY."""
+    r = understand_query("מהם המרכיבים של קרן SPY?")
+    assert r.primary_intent == "etf_holdings"
+    assert r.slots.get("ticker") == "SPY"
+
+
+def test_etf_holdings_hebrew_mirkivei_hakeren():
+    """מרכיבי הקרן SPY → etf_holdings, ticker=SPY."""
+    r = understand_query("מרכיבי הקרן SPY")
+    assert r.primary_intent == "etf_holdings"
+    assert r.slots.get("ticker") == "SPY"
+
+
+def test_etf_holdings_hebrew_harkav_keren():
+    """הרכב קרן SPY → etf_holdings, ticker=SPY."""
+    r = understand_query("הרכב קרן SPY")
+    assert r.primary_intent == "etf_holdings"
+    assert r.slots.get("ticker") == "SPY"
+
+
+def test_etf_holdings_advisory_spy_not_holdings():
+    """מה אתה חושב על SPY? → advisory, NOT etf_holdings."""
+    r = understand_query("מה אתה חושב על SPY?")
+    assert r.primary_intent != "etf_holdings"
+
+
+def test_etf_holdings_hebrew_ma_kollelim():
+    """מה כוללים הנכסים או המניות בתוך SPY? → etf_holdings, SPY."""
+    r = understand_query("מה כוללים הנכסים או המניות בתוך SPY?")
+    assert r.primary_intent == "etf_holdings"
+    assert r.slots.get("ticker") == "SPY"
+
+
+def test_etf_holdings_hebrew_eilu_menayot_bakeren():
+    """אילו מניות יש בקרן SPY? → etf_holdings, SPY."""
+    r = understand_query("אילו מניות יש בקרן SPY?")
+    assert r.primary_intent == "etf_holdings"
+    assert r.slots.get("ticker") == "SPY"

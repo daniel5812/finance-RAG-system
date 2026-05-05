@@ -443,6 +443,7 @@ _SQL_LABEL_MAP = {
     "price_lookup": "Market Prices",
     "etf_holdings": "ETF Holdings",
     "portfolio_lookup": "Portfolio Positions",
+    "data_availability_lookup": "Local Price Data Coverage",
 }
 
 # Template SQL strings — params are planner-resolved (not raw user input)
@@ -455,6 +456,8 @@ _SQL_TEMPLATES = {
     "etf_holdings_top20":"SELECT etf_symbol, holding_symbol, weight FROM etf_holdings WHERE etf_symbol='{symbol}' ORDER BY weight DESC LIMIT 20",
     # Portfolio positions: user's actual holdings (parameterized by user_id)
     "portfolio_lookup_positions": "SELECT symbol, quantity, cost_basis, currency, account FROM portfolio_positions WHERE source = 'manual' AND user_id = '{user_id}' ORDER BY date DESC LIMIT 50",
+    # Phase 4C: deterministic data availability summary against the prices table.
+    "data_availability_prices_summary": "SELECT symbol, COUNT(*) AS row_count, MAX(date) AS latest_date FROM prices GROUP BY symbol ORDER BY symbol",
 }
 
 
