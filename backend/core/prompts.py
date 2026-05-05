@@ -219,11 +219,36 @@ At the end:
 [[SuggestedQuestions: ["Q1", "Q2", "Q3"]]]\
 """
 
+# ── Advisory Wording Guard (Phase 4E) ──
+# Injected into advisory prompts to prevent personal-advice framing.
+# BUY/HOLD/REDUCE/AVOID remain valid as system classification labels;
+# the guard constrains how they are narrated to the user.
+ADVISORY_WORDING_GUARD = """\
+
+WORDING CONSTRAINT (mandatory):
+- Do not say "I recommend [stock]", "You should buy [stock]", "You should hold [stock]",
+  or use command-style phrasing that presents system analysis as personal investment advice.
+- Do not write "Hold NVDA" / "Buy AAPL" as an instruction to the user.
+  It is allowed to say: "The scoring model classifies NVDA as HOLD" when that classification is present in context.
+- Frame as analysis: "The analysis indicates...", "Signals suggest...",
+  "The scoring model classifies X as [action] based on..."
+- Directional guidance is allowed at strategy/asset-class level only
+  (e.g., "increasing fixed income may reduce concentration risk").
+- Every advisory response should include at least one uncertainty or context qualifier
+  (e.g., "based on available data", "subject to market conditions",
+  "individual circumstances vary").
+- Mention confidence only if confidence is explicitly present in the provided context.
+- Never open a response with '[Action] [Ticker]' or '[Ticker], [action]' constructions \
+(e.g., 'Hold NVDA', 'Buy AAPL', 'Sell TSLA') — always frame the classification as model output first, \
+not as a user directive.\
+"""
+
 # Assemble final system prompt
 CHAT_SYSTEM_PROMPT = "\n\n".join([
     CHAT_PERSONA,
     CHAT_OPERATIONAL_MODES,
     CHAT_BEHAVIOR_RULES,
+    ADVISORY_WORDING_GUARD,
     CHAT_OUTPUT_STRUCTURE,
     CHAT_SOURCE_RULES,
     CHAT_DOCUMENT_RULES,
@@ -288,27 +313,6 @@ Narrative paragraph only if no discrete facts exist.
 Partial: "לפי החלקים שנשלפו מהמסמך [D#]"
 CITATION: [D#] · [S#] · [I] — always bracketed. Space before bracket: "value [D1]" — NEVER "valueD1".
 Respond in the user's language (Hebrew question → Hebrew answer).
-"""
-
-# ── Advisory Wording Guard (Phase 4E) ──
-# Injected into advisory prompts to prevent personal-advice framing.
-# BUY/HOLD/REDUCE/AVOID remain valid as system classification labels;
-# the guard constrains how they are narrated to the user.
-ADVISORY_WORDING_GUARD = """\
-
-WORDING CONSTRAINT (mandatory):
-- Do not say "I recommend [stock]", "You should buy [stock]", "You should hold [stock]",
-  or use command-style phrasing that presents system analysis as personal investment advice.
-- Do not write "Hold NVDA" / "Buy AAPL" as an instruction to the user.
-  It is allowed to say: "The scoring model classifies NVDA as HOLD" when that classification is present in context.
-- Frame as analysis: "The analysis indicates...", "Signals suggest...",
-  "The scoring model classifies X as [action] based on..."
-- Directional guidance is allowed at strategy/asset-class level only
-  (e.g., "increasing fixed income may reduce concentration risk").
-- Every advisory response should include at least one uncertainty or context qualifier
-  (e.g., "based on available data", "subject to market conditions",
-  "individual circumstances vary").
-- Mention confidence only if confidence is explicitly present in the provided context.\
 """
 
 # ── Natural Advisory Response Prompt ──
