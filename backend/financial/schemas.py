@@ -41,6 +41,20 @@ class FilingsIngestRequest(BaseModel):
     filing_types: list[str] = Field(default=["10-K", "10-Q"])
 
 
+class PriceBackfillRequest(BaseModel):
+    symbols: list[str] | None = Field(
+        default=None,
+        description="Ticker symbols to backfill. If omitted, PRICE_BACKFILL_SYMBOLS config is used.",
+        examples=[["AAPL", "TSLA", "NVDA"]],
+    )
+    days: int | None = Field(
+        default=None,
+        gt=0,
+        description="Calendar days of history to request. If omitted, PRICE_BACKFILL_DEFAULT_DAYS config is used.",
+        examples=[365],
+    )
+
+
 # ── Portfolio Management ─────────────────────────────────────────────────────
 
 class PortfolioPositionCreate(BaseModel):

@@ -1,10 +1,11 @@
 """
-financial/routes/prices.py — Stock/ETF price ingestion endpoint.
-POST /financial/ingest/prices
+financial/routes/prices.py — Stock/ETF price ingestion endpoints.
+POST /financial/ingest/prices          — single-symbol Stooq ingest
+POST /financial/ingest/prices/backfill — multi-symbol YFinance backfill (admin/internal)
 """
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
 from fastapi import APIRouter, HTTPException, Depends
@@ -12,8 +13,9 @@ import asyncpg
 from core.dependencies import get_db_pool
 
 from core.logger import get_logger
-from financial.providers.price import StooqProvider
-from financial.schemas import PriceIngestRequest
+from financial.providers.price import StooqProvider, YFinancePriceProvider
+from financial.schemas import PriceIngestRequest, PriceBackfillRequest
+from core.config import PRICE_BACKFILL_SYMBOLS, PRICE_BACKFILL_DEFAULT_DAYS
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/financial", tags=["financial - prices"])
@@ -61,3 +63,59 @@ async def ingest_prices(
 
     result["symbol"] = request.symbol
     return result
+
+
+@router.post("/ingest/prices/backfill")
+async def backfill_prices(
+    request: PriceBackfillRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+):
+    """
+    Backfill historical daily prices for a list of symbols via Yahoo Finance.
+
+    Uses YFinancePriceProvider (no API key required). Calls ingest_incremental
+    per symbol so already-stored rows are skipped. Per-symbol failures are
+    caught and reported without stopping the remaining batch.
+
+    NOTE: This is an internal/admin route. It should be protected by an
+    API-key or role check in the cross-cutting auth phase.
+    """
+    symbols = [s.strip().upper() for s in request.symbols] if request.symbols is not None else PRICE_BACKFILL_SYMBOLS
+    days = request.days if request.days is not None else PRICE_BACKFILL_DEFAULT_DAYS
+    start_date = date.today() - timedelta(days=days)
+
+    results = []
+    succeeded = 0
+    failed = 0
+
+    for symbol in symbols:
+        try:
+            provider = YFinancePriceProvider(symbol=symbol, start=start_date)
+            outcome = await provider.ingest_incremental(pool)
+            results.append({
+                "symbol": symbol,
+                "status": "success",
+                "rows_ingested": outcome.get("rows_ingested"),
+                "error": None,
+            })
+            succeeded += 1
+        except Exception as exc:
+            logger.error(json.dumps({
+                "event": "price_backfill_symbol_failed",
+                "symbol": symbol,
+                "error": str(exc),
+            }))
+            results.append({
+                "symbol": symbol,
+                "status": "failed",
+                "rows_ingested": None,
+                "error": str(exc),
+            })
+            failed += 1
+
+    return {
+        "results": results,
+        "total_symbols": len(symbols),
+        "succeeded": succeeded,
+        "failed": failed,
+    }

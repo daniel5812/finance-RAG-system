@@ -87,3 +87,18 @@ DOCUMENT_UPLOAD_DIR = os.getenv("DOCUMENT_UPLOAD_DIR", "./uploads")
 # DOCUMENT_MAX_SIZE_MB: hard limit on upload size.
 #   50 MB is generous for pension statements / broker reports; adjust as needed.
 DOCUMENT_MAX_SIZE_MB = int(os.getenv("DOCUMENT_MAX_SIZE_MB", "50"))
+
+# ── Price Backfill ──
+# PRICE_BACKFILL_SYMBOLS: comma-separated list of tickers seeded by the
+#   /financial/ingest/prices/backfill admin route.  Not used at startup.
+_raw_backfill_symbols = os.getenv(
+    "PRICE_BACKFILL_SYMBOLS",
+    "SPY,QQQ,VOO,AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META",
+)
+PRICE_BACKFILL_SYMBOLS: list[str] = [
+    s.strip().upper() for s in _raw_backfill_symbols.split(",") if s.strip()
+]
+
+# PRICE_BACKFILL_DEFAULT_DAYS: how many calendar days of history to request
+#   when no 'days' value is provided in the backfill request.
+PRICE_BACKFILL_DEFAULT_DAYS = int(os.getenv("PRICE_BACKFILL_DEFAULT_DAYS", "365"))
