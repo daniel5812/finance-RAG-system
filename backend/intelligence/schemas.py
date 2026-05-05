@@ -162,6 +162,10 @@ class NormalizedPortfolio(BaseModel):
     positions: dict[str, PositionDetail] = Field(default_factory=dict)  # ticker → computed detail
     total_market_value: Optional[float] = None      # SUM(qty × price) — total market value
     prices_as_of: Optional[date] = None             # staleness label
+    # Derived metrics (Step 2)
+    concentration_score: Optional[float] = None     # HHI: Σ(weight)² for all positions, 0–1
+    diversification_score: Optional[float] = None   # 1 − normalized HHI, 0–1 (1=perfect, 0=single)
+    sector_exposure_pct: Optional[dict[str, float]] = None  # sector → % of portfolio by market value
 
     data_note: str = (
         "Allocation % is based on cost_basis × quantity (invested capital). "
