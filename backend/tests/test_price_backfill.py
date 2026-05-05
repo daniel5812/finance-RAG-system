@@ -88,6 +88,21 @@ def client():
         yield c
 
 
+@pytest.fixture()
+def admin_client():
+    """TestClient with get_current_user_claims overridden to inject admin scope."""
+    from main import app
+    from core.dependencies import get_current_user_claims
+
+    async def override_claims():
+        return {"sub": "test_admin", "scopes": ["admin"]}
+
+    app.dependency_overrides[get_current_user_claims] = override_claims
+    with TestClient(app, raise_server_exceptions=True) as c:
+        yield c
+    app.dependency_overrides.pop(get_current_user_claims, None)
+
+
 def _mock_pool():
     pool = MagicMock()
     return pool
@@ -96,14 +111,14 @@ def _mock_pool():
 # For route tests we patch at the provider level so no real network call occurs.
 
 @patch("financial.routes.prices.YFinancePriceProvider")
-def test_backfill_uses_configured_symbols_when_request_empty(MockProvider, client):
+def test_backfill_uses_configured_symbols_when_request_empty(MockProvider, admin_client):
     from core.config import PRICE_BACKFILL_SYMBOLS
 
     instance = MockProvider.return_value
     instance.ingest_incremental = AsyncMock(return_value=_make_success_outcome("X"))
 
     with patch("financial.routes.prices.get_db_pool", return_value=lambda: _mock_pool()):
-        resp = client.post("/financial/ingest/prices/backfill", json={})
+        resp = admin_client.post("/financial/ingest/prices/backfill", json={})
 
     assert resp.status_code == 200
     data = resp.json()
@@ -113,11 +128,11 @@ def test_backfill_uses_configured_symbols_when_request_empty(MockProvider, clien
 
 
 @patch("financial.routes.prices.YFinancePriceProvider")
-def test_backfill_explicit_symbols_override_defaults(MockProvider, client):
+def test_backfill_explicit_symbols_override_defaults(MockProvider, admin_client):
     instance = MockProvider.return_value
     instance.ingest_incremental = AsyncMock(return_value=_make_success_outcome("AAPL"))
 
-    resp = client.post(
+    resp = admin_client.post(
         "/financial/ingest/prices/backfill",
         json={"symbols": ["AAPL", "TSLA"]},
     )
@@ -129,11 +144,11 @@ def test_backfill_explicit_symbols_override_defaults(MockProvider, client):
 
 
 @patch("financial.routes.prices.YFinancePriceProvider")
-def test_backfill_calls_ingest_incremental_per_symbol(MockProvider, client):
+def test_backfill_calls_ingest_incremental_per_symbol(MockProvider, admin_client):
     instance = MockProvider.return_value
     instance.ingest_incremental = AsyncMock(return_value=_make_success_outcome("X"))
 
-    resp = client.post(
+    resp = admin_client.post(
         "/financial/ingest/prices/backfill",
         json={"symbols": ["AAPL", "MSFT", "NVDA"]},
     )
@@ -142,7 +157,7 @@ def test_backfill_calls_ingest_incremental_per_symbol(MockProvider, client):
 
 
 @patch("financial.routes.prices.YFinancePriceProvider")
-def test_backfill_per_symbol_failure_does_not_stop_others(MockProvider, client):
+def test_backfill_per_symbol_failure_does_not_stop_others(MockProvider, admin_client):
     instance = MockProvider.return_value
 
     call_count = 0
@@ -156,7 +171,7 @@ def test_backfill_per_symbol_failure_does_not_stop_others(MockProvider, client):
 
     instance.ingest_incremental.side_effect = side_effect
 
-    resp = client.post(
+    resp = admin_client.post(
         "/financial/ingest/prices/backfill",
         json={"symbols": ["AAPL", "TSLA"]},
     )
@@ -170,11 +185,11 @@ def test_backfill_per_symbol_failure_does_not_stop_others(MockProvider, client):
 
 
 @patch("financial.routes.prices.YFinancePriceProvider")
-def test_backfill_response_shape(MockProvider, client):
+def test_backfill_response_shape(MockProvider, admin_client):
     instance = MockProvider.return_value
     instance.ingest_incremental = AsyncMock(return_value=_make_success_outcome("SPY", rows=100))
 
-    resp = client.post(
+    resp = admin_client.post(
         "/financial/ingest/prices/backfill",
         json={"symbols": ["SPY"]},
     )
@@ -195,12 +210,12 @@ def test_backfill_response_shape(MockProvider, client):
     assert row["error"] is None
 
 
-def test_backfill_rejects_empty_symbols_list(client):
+def test_backfill_rejects_empty_symbols_list(admin_client):
     # An explicit empty list is not the same as omitting symbols.
     # The schema allows it (no min_items constraint) but the route
     # will return total_symbols=0 with empty results — not a 422.
     # Validate the schema accepts it and the route returns a coherent response.
-    resp = client.post(
+    resp = admin_client.post(
         "/financial/ingest/prices/backfill",
         json={"symbols": []},
     )
@@ -212,14 +227,14 @@ def test_backfill_rejects_empty_symbols_list(client):
     assert data["results"] == []
 
 
-def test_backfill_rejects_non_positive_days_via_http(client):
-    resp = client.post(
+def test_backfill_rejects_non_positive_days_via_http(admin_client):
+    resp = admin_client.post(
         "/financial/ingest/prices/backfill",
         json={"days": 0},
     )
     assert resp.status_code == 422
 
-    resp = client.post(
+    resp = admin_client.post(
         "/financial/ingest/prices/backfill",
         json={"days": -10},
     )
