@@ -56,8 +56,12 @@ _REASONING_PROMPT = """\
 You are an investment analyst writing a concise recommendation explanation.
 
 The DECISION has already been made by our scoring system. Your job is ONLY to
-write 2-3 clear sentences explaining WHY this specific action is appropriate
-given the data below. Do NOT second-guess or override the action.
+write 2-3 clear sentences describing what the score signals indicate about this asset,
+and why the scoring model classified it as [action] given the data below.
+Do NOT second-guess or override the action.
+Do NOT write "you should" or "I recommend". Frame the output as analysis:
+"The score indicates...", "Scoring signals suggest...", or
+"Under current conditions, the data shows...".
 
 Asset: {ticker}
 Action: {action}
@@ -70,7 +74,7 @@ Score Factors:
 {factors}
 
 Write:
-1. reasoning: 2-3 sentences explaining the action given the score factors and context.
+1. reasoning: 2-3 sentences describing what the score signals indicate and why the scoring model classified this asset as [action] given the score factors and context.
 2. trade_offs: 1 sentence naming the main trade-off (what the user gives up with this action).
 3. risks: 2-3 bullet point risks (as a JSON array of strings).
 
